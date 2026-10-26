@@ -27,34 +27,40 @@
             timer-cancel
             create-poll))
 
-;; Constructors on the AstalIO.Time class, as G-Golf names them.
-(eval-when (expand load eval)
-  (use-modules (g-golf))
-  (g-irepository-require "AstalIO" #:version "0.1")
-  (gi-import-by-name "AstalIO" "Time"))
+;; GLib's own sources rather than AstalIO.Time.
+;;
+;; AstalIO.Time's constructors take a GObject.Closure for the callback, and
+;; passing a Scheme procedure through that path fails at the C boundary with
+;; "string->pointer: Wrong type argument (expecting string)" -- an error that
+;; names neither the timer nor the callback.  GLib's g-timeout-add and
+;; g-idle-add are what AstalIO.Time wraps in the first place, take a plain
+;; procedure, and are already exercised by the REPL's wake source, so there is
+;; nothing to gain from the extra layer here.
+;;
+;; A callback returns #t to keep the timer running and #f to stop it, which is
+;; GLib's own convention.
 
 (define* (interval ms proc #:key (name 'interval) (immediate #f))
   "Call PROC every MS milliseconds.  Returns a timer; `timer-cancel' stops it.
 
-The AstalIO.Time constructor runs the callback immediately as well as on each
-tick, which is usually what a widget wants -- a clock should not show a blank
-for its first second."
-  (astal-io-time-interval ms (lambda (self) (proc))))
+With IMMEDIATE, PROC also runs at once, so a clock does not show a blank for
+its first interval."
+  (when immediate (proc))
+  (g-timeout-add ms (lambda () (proc) #t)))
 
 (define* (timeout ms proc #:key (name 'timeout))
-  "Call PROC once after MS milliseconds."
-  (astal-io-time-timeout ms (lambda (self) (proc))))
+  "Call PROC once after MS milliseconds.  Returns a timer."
+  (g-timeout-add ms (lambda () (proc) #f)))
 
 (define* (idle proc #:key (name 'idle))
   "Call PROC once, as soon as the main loop is idle."
-  (astal-io-time-idle (lambda (self) (proc))))
+  (g-idle-add (lambda () (proc) #f)))
 
 (define (timer-cancel timer)
   "Stop TIMER.  Idempotent, and safe to call from a cleanup."
-  (catch #t
-    (lambda () (astal-io-time-cancel timer))
-    (lambda args #f))
-  timer)
+  (when timer
+    (catch #t (lambda () (g-source-remove timer)) (lambda args #f)))
+  #t)
 
 ;;; ---------------------------------------------------------------------------
 ;;; create-poll
