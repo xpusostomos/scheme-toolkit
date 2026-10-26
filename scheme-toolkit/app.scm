@@ -311,9 +311,22 @@ Returns the application's exit status."
                  (when repl? (try-start-repl! instance))
                  (when main (main))
                  ;; Present everything registered, now that a window may exist.
-                 (for-each (lambda (w)
-                             (catch #t (lambda () (present w)) (lambda args #f)))
-                           (windows))))))
+                 ;;
+                 ;; A failure here is REPORTED, not swallowed.  It was silent
+                 ;; once and cost an hour: the windows were built, no surface
+                 ;; appeared, and there was nothing in the log to say why.  A
+                 ;; window that cannot be presented is always a bug worth
+                 ;; seeing.
+                 (for-each
+                  (lambda (w)
+                    (catch #t
+                      (lambda () (present w))
+                      (lambda (key . args)
+                        (format (current-error-port)
+                                "scheme-toolkit: cannot present window ~s: ~a ~s~%"
+                                (catch #t (lambda () (slot-ref w 'name)) (lambda a '?))
+                                key args))))
+                  (windows))))))
   (run %app '()))
 
 (define (try-start-repl! instance)

@@ -10,7 +10,7 @@ here names the DESKTOP milestone that exercises it; read the two side by side.
 **Target platform:** GTK4, Astal (GTK4 namespaces), Wayland/Hyprland.
 GTK3 is explicitly out of scope.
 
-**Local reference checkouts used throughout:** AGS at `~/GIT/ags` (v3.1.2),
+**Local reference checkouts used throughout:** AGS at `~/GITE/ags` (v3.1.2),
 Gnim at `~/GITE/gnim` (v1.9.1), the shells under `~/GITE/ags-shells/`, G-Golf
 source at `/tmp/guile-g-golf/src/g-golf-0.8.7` (the AUR build tree; its
 `examples/`, `doc/` and `test-suite/` are the authoritative G-Golf reference).
@@ -25,7 +25,7 @@ G-Golf 0.8.7 on this machine. The headline corrections to the first draft:
 1. **AGS 3.1.2 does not use `AstalIO.Application` or `acquire_socket`.** It is a
    plain `Gtk.Application` whose `application-id` is `io.Astal.<instance>`, and it
    serves the `io.Astal.Application` D-Bus interface *itself* using Gnim's D-Bus
-   helper (`~/GIT/ags/lib/gtk4/app.ts`, `lib/app/dbus.ts`). The Go CLI is a plain
+   helper (`~/GITE/ags/lib/gtk4/app.ts`, `lib/app/dbus.ts`). The Go CLI is a plain
    D-Bus client (`cli/lib/astal.go`). The D-Bus server path was **verified
    working under G-Golf** (§ 3), so serving the same four methods is a cheap
    optional shim that keeps the stock `ags` binary working — but it is not the
@@ -75,7 +75,7 @@ G-Golf 0.8.7 on this machine. The headline corrections to the first draft:
 
 ## 1. What this is, and what it replaces
 
-AGS v3 is much smaller than it looks. Measured from `~/GIT/ags` and `~/GITE/gnim`:
+AGS v3 is much smaller than it looks. Measured from `~/GITE/ags` and `~/GITE/gnim`:
 
 | Component | Size | What it does | Scheme-toolkit equivalent |
 |---|---|---|---|
@@ -84,7 +84,7 @@ AGS v3 is much smaller than it looks. Measured from `~/GIT/ags` and `~/GITE/gnim
 | Gnim 1.9.1 | 4,377 lines | `jsx/state.ts` (847: Accessor, createState/Computed/Memo/Effect/Binding/Connection/External/Settings), `jsx/jsx.ts` (373: the element runtime), `jsx/scope.ts` (185: Scope, createRoot, onCleanup, onMount, createContext), `For`/`With`/`This`/`Fragment` (~300), `gtk4/jsx-runtime.ts` (149: GTK4 child-insertion rules), `dbus.ts` (870: Service/iface/method/property decorators + proxy), `gobject.ts` (521: `@register`/`@property`/`@signal`), `fetch.ts` (411: WHATWG fetch polyfill), `variant.ts` (348: TS-level types only) | **`state`+`scope`+`jsx`+`For/With/This` → the toolkit's core (M1–M2).** `dbus.ts` → `(scheme-toolkit dbus)` (M5). `gobject.ts` → *nothing*: G-Golf's `define-class` already is the decorator layer. `fetch.ts` → *nothing*: Guile has `(web client)`. `variant.ts` → *nothing* |
 
 There is no XML/`.ui` widget language in AGS and never was (see
-`~/GIT/ags/GUILE-PORT-AGS.md` for the archaeology). This is a parallel frontend
+`~/GITE/ags/GUILE-PORT-AGS.md` for the archaeology). This is a parallel frontend
 sharing Astal and the `io.Astal.Application` contract, not a fork.
 
 **Astal is the backend and is not reimplemented.** Astal is Vala/C + GObject
@@ -505,7 +505,7 @@ props object; a Scheme variadic keyword procedure does exactly the same:
         (popover (calendar))))))
 ```
 
-That is the AGS starter template (`~/GIT/ags/cli/data/gtk4/Bar.tsx`) line for
+That is the AGS starter template (`~/GITE/ags/cli/data/gtk4/Bar.tsx`) line for
 line. Build:
 
 - `(element <class> . args)` — the runtime: splits keywords into props /
@@ -552,7 +552,7 @@ anything that wraps `make` beyond `element`.
    `demo-child.scm` for custom widgets (`define-vfunc` `measure`/`allocate`).
 3. **ags2-shell** `widget/Bar/components/Buttons/Battery.tsx`, **colorshell**
    `src/window/bar/widgets/Clock.tsx` — target ergonomics.
-4. **`~/GIT/ags/cli/data/gtk4/Bar.tsx`** — the 30-line acceptance test.
+4. **`~/GITE/ags/cli/data/gtk4/Bar.tsx`** — the 30-line acceptance test.
 5. **`tsyesika/guile-gui-sandbox`** (Codeberg) — a Guile declarative-GTK sketch
    with reactive cells; design reference only, its author says "do not use".
 
@@ -731,7 +731,7 @@ the **counter-example HyprYou**, which hand-rolls network (911 lines), tray
 lifecycle, controlled through the REPL (M0.5), with D-Bus available for the
 things that genuinely need it.
 
-**What AGS does, from `~/GIT/ags/lib/gtk4/app.ts` and `cli/lib/astal.go`, and
+**What AGS does, from `~/GITE/ags/lib/gtk4/app.ts` and `cli/lib/astal.go`, and
 what we do instead:**
 
 | Piece | AGS 3.1.2 behaviour | Scheme |
@@ -789,8 +789,8 @@ what we do instead:**
 `(scheme-toolkit repl)`.
 
 **Reference implementations:**
-- **`~/GIT/ags/lib/gtk4/app.ts`** (328 lines) — the lifecycle, CSS and theme
-  helpers to mirror; `lib/app/dbus.ts` (51) + **`~/GIT/ags/cli/lib/astal.go`**
+- **`~/GITE/ags/lib/gtk4/app.ts`** (328 lines) — the lifecycle, CSS and theme
+  helpers to mirror; `lib/app/dbus.ts` (51) + **`~/GITE/ags/cli/lib/astal.go`**
   for the shim's exact contract (the Go client treats `NoReply`/"Remote peer
   disconnected" on `Quit` as success).
 - **`~/GITE/gnim/src/dbus.ts`** + `docs/dbus.md` — the D-Bus layer's shape.
@@ -865,7 +865,7 @@ reload on palette change.
 
 **Reference:** **colorshell `src/modules/stylemanager.ts`** (189) — reload on
 wallpaper change, `colors-updated` signal. **ags2-shell `style/`** +
-`style/runtime-css.ts` (314) — runtime CSS from options. **`~/GIT/ags/lib/gtk4/app.ts:183`**
+`style/runtime-css.ts` (314) — runtime CSS from options. **`~/GITE/ags/lib/gtk4/app.ts:183`**
 `apply_css` for the error-reporting pattern. **Gnim `gtk4/jsx-runtime.ts:29
 setCss`** for per-widget providers.
 
@@ -926,7 +926,7 @@ name and shows history.
 per-shell convenience CLI (colorshell style `shell volume up`) is a DESKTOP
 concern and is a shell script of `eval` calls, not a parser.
 
-**Reference:** `~/GIT/ags/lib/{process,time,file}.ts` (API surface to match);
+**Reference:** `~/GITE/ags/lib/{process,time,file}.ts` (API surface to match);
 `AstalIO-0.1.gir` (`Process`, `Time`); ags2-shell `lib/result.ts`,
 `lib/commands.ts` (one subprocess chokepoint).
 

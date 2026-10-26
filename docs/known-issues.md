@@ -44,6 +44,30 @@ Known taken so far: `peek`, `create-context`, `start`, `stop`, `show`, `hide`,
 `quit`, `present`, `accessor`. The toolkit uses `run-shell`, `quit-shell`,
 `st-peek` and `<st-accessor>` for this reason.
 
+## `#:namespace` on a layer window makes it invisible
+
+**Symptom.** A window built with a custom layer-shell namespace — e.g.
+`(layer-window "bar" #:namespace "scheme-desktop" ...)` — is constructed, is
+registered, `present` returns without error, and **no surface ever appears**.
+`hyprctl layers` shows nothing, and there is no diagnostic anywhere, because the
+failure is on the compositor side: Hyprland keeps no layer surface for it.
+
+Removing `#:namespace` and letting the default (`gtk4-layer-shell`) stand makes
+the same window appear immediately.
+
+**Status.** Not yet diagnosed past the symptom. `Astal.Window`'s `namespace`
+property is settable after `gtk4_layer_shell_init`, which happens at
+construction, so an ordering problem in Astal is plausible — but that is a guess.
+
+**Workaround.** Do not pass `#:namespace`. `layer-window` still accepts it,
+because it may work on other compositors or with different values, but the
+desktop shell omits it and says why.
+
+**Cost when it bit.** An hour, because the `present` call in `run-shell` was
+wrapped in a `catch` that discarded the exception. That `catch` now reports, and
+the general lesson is worth keeping: a swallowed exception at a lifecycle
+boundary turns a ten-second diagnosis into a long one.
+
 ## The REPL back door has no socket wiring
 
 `(scheme-toolkit repl coop-server)` and `(scheme-toolkit repl client)` are
