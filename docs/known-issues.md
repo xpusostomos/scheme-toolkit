@@ -80,3 +80,45 @@ The client still speaks schemacs's discovery protocol — a TCP port written to
 by instance this project wants. `client.scm` needs `repl-port-files` and
 `repl-connect` adapted to `.sock` files under `$XDG_RUNTIME_DIR/scheme-toolkit/`.
 
+
+## G-Golf's `define-class` is fussy about class options
+
+Three things, all found while building `define-service`, two of which produce
+errors that point at the wrong place.
+
+**1. Slots must come before keyword options.** `class`'s parser
+(`hl-api/gtype.scm`) reads slots until it meets the first keyword and then
+requires keywords for the rest of the list. A keyword option written *before* a
+slot makes it try to read the slots as keyword/value pairs. Worse, the failure
+message shows only the *remaining* arguments, so it points at the slots -- which
+are fine -- while the real problem is an option earlier in the list.
+
+**2. Exactly one `#:g-signal`.** Two fail the same way. `install-signals` loops
+over every `#:g-signal` it finds, so this is a parser limitation rather than a
+design one. It is not order-dependent.
+
+**3. `#:g-type-name` is silently ignored.** The GType name always derives from
+the *class* name:
+
+    (define-class <tn-test> (<gobject>) ... #:g-type-name "StTnTest")
+    (g-type-name (!g-type (class-of (make <tn-test>))))   ; => "TnTest"
+
+This matters because GLib rejects a type name shorter than three characters, so
+a class named `<t1>` fails to define with "type name 'T1' is too short" -- a
+message that never mentions `#:g-type-name`, which looked like it should have
+overridden the name.
+
+## A custom signal cannot be emitted from Scheme
+
+G-Golf declares a signal for `#:g-signal` and generates **no emitter** for it.
+There is no high-level emit: `g_signal_emit_by_name` is varargs and does not
+bind, and `g-signal-emitv` needs a hand-built array of `GValue`s, which is
+reachable but unfinished here.
+
+`service-emit` was written, did not work, and was **removed** rather than shipped
+failing.
+
+Not a blocker: a widget binds to a *property*, and GObject supplies
+`notify::` for a declared property with no help at all. A shell service in this
+toolkit therefore exposes state as properties and only declares signals for
+external code to subscribe to.
