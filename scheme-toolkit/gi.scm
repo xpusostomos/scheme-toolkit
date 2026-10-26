@@ -26,7 +26,12 @@
 
   ;; Re-export the G-Golf surface a shell needs, so that consumers can import
   ;; this one module instead of both.  `#:re-export' keeps the original
-  ;; bindings (and their generics) rather than copying them.
+  ;; bindings rather than copying them.
+  ;;
+  ;; Only names that (g-golf) itself defines can be listed here.  GI classes
+  ;; such as <gtk-widget> do NOT exist until a namespace is imported, so naming
+  ;; one re-exports an unbound variable and the module fails to load -- which is
+  ;; exactly what happened.  Import Gtk with define-gi-imports to get those.
   #:re-export (gi-import
                gi-import-by-name
                g-irepository-require
@@ -35,8 +40,7 @@
                make
                connect
                disconnect
-               <gobject>
-               <gtk-widget>)
+               <gobject>)
 
   #:export (define-gi-imports
             gi-require
@@ -270,7 +274,7 @@ supports the protocol.  Returns #f if the namespace is absent altogether."
 ;;; 6. Diagnostics
 ;;; ---------------------------------------------------------------------------
 
-(define (environment-report #:optional (port (current-output-port)))
+(define* (environment-report #:optional (port (current-output-port)))
   "Print what the environment actually looks like from inside a running
 process.  The standalone version, which needs nothing loaded, is
 tools/check-env.scm."

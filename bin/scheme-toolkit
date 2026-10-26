@@ -46,17 +46,23 @@ runtime_dir() {
     printf '%s' "$d"
 }
 
-# Load path for our own modules: every subproject in the checkout contributes.
+# Load path.  -L names the directory that CONTAINS the package directory, not
+# the package directory itself: (scheme-toolkit gi) resolves to
+# <entry>/scheme-toolkit/gi.scm, so the entry must be $TOOLKIT_ROOT, whose
+# child scheme-toolkit/ holds the modules.
+#
+# Getting this one level wrong is silent and confusing -- Guile resolves the
+# module name to an empty module and reports "no code for module" as though
+# the file were malformed.
 load_args() {
-    printf -- '-L %s' "$TOOLKIT_ROOT/scheme-toolkit"
-    # Sibling subprojects, so scheme-desktop finds (scheme-desktop ...) and
-    # scheme-toolkit is found from anywhere in the tree.
-    for d in "$TOOLKIT_ROOT"/*/; do
+    printf -- '-L %s' "$TOOLKIT_ROOT"
+    # Sibling subprojects in the same checkout, so a shell in scheme-desktop/
+    # can import (scheme-desktop ...) and still see (scheme-toolkit ...).
+    for d in "$TOOLKIT_ROOT/.."/*/; do
+        d="$(readlink -f "$d")"
+        [ "$d" = "$TOOLKIT_ROOT" ] && continue
         [ -d "$d" ] || continue
-        case "$(basename "$d")" in
-            scheme-toolkit|tools|bin|docs|tests|examples) ;;
-            *) [ -d "${d}$(basename "$d")" ] && printf -- ' -L %s' "${d}" ;;
-        esac
+        printf -- ' -L %s' "$d"
     done
 }
 
