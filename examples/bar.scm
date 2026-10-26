@@ -25,17 +25,14 @@
   "EventControllerKey")
 (define-gi-imports "Astal" "Window")
 
-;; D1 keeps the clock STATIC, as the plan specifies: the milestone is about the
-;; element runtime and the window, and a live clock is D2.  The AGS template
-;; takes its text from
+;; A live clock, from the same poll the AGS template uses:
 ;;
 ;;   const time = Variable("", { poll: [1000, "date +%H:%M"] })
 ;;
-;; and the Scheme equivalent is (create-poll 1000 '("date" "+%H:%M")), which
-;; (scheme-toolkit time) provides -- but wiring a poll into a widget property
-;; hits a bug that is being tracked separately, so this is a fixed string for
-;; now.  Nothing else in the bar depends on it.
-(define clock-text "00:00")
+;; (create-poll 1000 '("date" "+%H:%M")) is the Scheme equivalent.  Binding it
+;; to a widget property is what makes it live: the element runtime subscribes
+;; and re-sets #:label whenever the accessor's value changes.
+(define clock (create-poll 1000 '("date" "+%H:%M")))
 
 (define (build-bar monitor name)
   "One bar per monitor.  NAME comes from for-each-monitor and is the output's
@@ -61,8 +58,10 @@ hotplug."
 
             ;; centre
             (element <gtk-box> #:slot 'center
+                     ;; `clock' is an accessor, so this label updates on
+                     ;; its own -- the reactive half of the element runtime.
                      (element <gtk-label>
-                              #:label clock-text
+                              #:label clock
                               #:class "clock"))
 
             ;; end

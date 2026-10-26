@@ -138,7 +138,7 @@
     (dispose)))
 
 (test-group "contexts"
-  (define-values (provide use-ctx) (create-context 'default))
+  (define-values (provide use-ctx) (st-create-context 'default))
   (create-root (lambda (_dispose)
                  (provide 'provided)))
   ;; Outside the root that provided it, the default shows through.

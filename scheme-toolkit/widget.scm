@@ -358,7 +358,7 @@ with until the object exists."
                  ;; The keyword itself goes through to `make': GOOPS wants
                  ;; #:label, not the bare symbol `label'.
                  (set! ctor-props
-                       (cons (cons kw (if (accessor? val) (peek val) val))
+                       (cons (cons kw (if (accessor? val) (st-peek val) val))
                              ctor-props))))))))
      kw-args)
     ;; Reverse to restore source order, then flatten to the keyword arguments
@@ -378,11 +378,11 @@ the accessor changes.  The subscription is registered with on-cleanup, which is
 what makes disposing a widget tree leave no handlers behind."
   (let ((sym (string->symbol prop)))
     (catch #t
-      (lambda () (slot-set! obj sym (peek acc)))
+      (lambda () (slot-set! obj sym (st-peek acc)))
       (lambda (key . args)
         (error "cannot bind property" prop "on" (class-name (class-of obj)))))
     (on-cleanup (subscribe acc (lambda ()
-                                 (slot-set! obj sym (peek acc)))))))
+                                 (slot-set! obj sym (st-peek acc)))))))
 
 (define (connect-signal! obj signal proc)
   (let ((id (connect obj (string->symbol signal)
@@ -433,13 +433,13 @@ bindings (a property whose value is an accessor), or one of the specials #:class
             ;; class and css.
             (when klass
               (if (accessor? klass)
-                  (begin (apply-class! obj (peek klass))
-                         (on-cleanup (subscribe klass (lambda () (apply-class! obj (peek klass))))))
+                  (begin (apply-class! obj (st-peek klass))
+                         (on-cleanup (subscribe klass (lambda () (apply-class! obj (st-peek klass))))))
                   (apply-class! obj klass)))
             (when css
               (if (accessor? css)
-                  (begin (apply-css! obj (peek css))
-                         (on-cleanup (subscribe css (lambda () (apply-css! obj (peek css))))))
+                  (begin (apply-css! obj (st-peek css))
+                         (on-cleanup (subscribe css (lambda () (apply-css! obj (st-peek css))))))
                   (apply-css! obj css)))
             (when slot (set-child-type! obj slot))
             (when setup (hashq-set! %setups obj setup))
@@ -484,7 +484,7 @@ bindings (a property whose value is an accessor), or one of the specials #:class
                      (val (cdr pair)))
                  (catch #t
                    (lambda () (slot-set! obj (string->symbol prop)
-                                         (if (accessor? val) (peek val) val)))
+                                         (if (accessor? val) (st-peek val) val)))
                    (lambda args #f))))
              deferred)
             ;; The $ setup callback runs last, on a complete node.
@@ -509,8 +509,8 @@ without rebuilding it."
            (cond
             ((%special-prop? kw)
              (case kw
-               ((#:class) (apply-class! obj (if (accessor? val) (peek val) val)))
-               ((#:css) (apply-css! obj (if (accessor? val) (peek val) val)))
+               ((#:class) (apply-class! obj (if (accessor? val) (st-peek val) val)))
+               ((#:css) (apply-css! obj (if (accessor? val) (st-peek val) val)))
                ((#:setup) (hashq-set! %setups obj val) (val obj))
                ((#:slot) (set-child-type! obj val))
                (else #f)))

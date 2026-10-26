@@ -27,7 +27,7 @@
   #:export (run-shell quit-shell
             app-instance
             layer-window window-set-anchored!
-            windows window
+            windows window windows-named window-visible?
             toggle-window
             monitors for-each-monitor monitor-name monitor-geometry
             on-monitors-changed

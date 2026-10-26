@@ -5,7 +5,7 @@
 ;;; because it is what everything else depends on:
 ;;;
 ;;;   - An ACCESSOR is callable.  (acc) reads its value *and records a
-;;;     dependency* when a computation is tracking it; (peek acc) reads without
+;;;     dependency* when a computation is tracking it; (st-peek acc) reads without
 ;;;     recording.
 ;;;
 ;;;   - Accessors are COLD.  A derived accessor subscribes to its sources only
@@ -23,9 +23,9 @@
 ;;;     accessor" (as in a clock's (time (lambda (t) ...))), which the shells
 ;;;     use constantly, and a read/write pun would hide mutation.
 ;;;
-;;; Why <accessor> is a distinct type and not a plain lambda: the element
+;;; Why <st-accessor> is a distinct type and not a plain lambda: the element
 ;;; runtime must tell "this prop is a reactive value to bind" from "this prop is
-;;; an event handler to connect".  Both are procedures.  Making <accessor> an
+;;; an event handler to connect".  Both are procedures.  Making <st-accessor> an
 ;;; applicable GOOPS struct gives (acc) *and* a real predicate.
 ;;;
 ;;; The two pieces of dynamic state -- the dependency set being collected, and
@@ -40,15 +40,15 @@
   #:use-module (oop goops)
   #:use-module (srfi srfi-1)
 
-  #:export (accessor? accessor-name
+  #:export (accessor? accessor-name <st-accessor>
             create-accessor
-            peek subscribe as
+            st-peek subscribe as
             create-state create-computed create-memo
             create-effect create-binding create-connection
             create-root dispose-root
             on-cleanup on-mount
             get-scope with-scope
-            create-context))
+            st-create-context))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Dynamic state
@@ -87,7 +87,7 @@
 ;; <applicable-struct-with-setter-class> for an <applicable-struct> subclass,
 ;; which makes the class a *generic function*: instances then carry
 ;; methods/setter slots and are not callable at all ("No applicable method").
-(define <accessor>
+(define <st-accessor>
   (class (<applicable-struct>)
     (procedure #:init-keyword #:procedure)
     (peek-fn   #:init-keyword #:peek)
@@ -95,9 +95,9 @@
     (version-fn #:init-keyword #:version-fn #:init-value (lambda () 0))
     (name      #:init-keyword #:name #:init-value 'accessor)
     #:metaclass <applicable-struct-class>
-    #:name '<accessor>))
+    #:name '<st-accessor>))
 
-(define (accessor? x) (is-a? x <accessor>))
+(define (accessor? x) (is-a? x <st-accessor>))
 (define (accessor-name acc) (slot-ref acc 'name))
 
 ;; Every accessor has a version that ticks when its value changes.  create-state
@@ -115,7 +115,7 @@
   "Build an accessor over PEEK-FN.  The one-argument call derives a computed,
 matching Gnim's (time (lambda (t) ...)) idiom."
   (define acc #f)
-  (set! acc (make <accessor>
+  (set! acc (make <st-accessor>
               #:procedure (lambda args
                             (case (length args)
                               ((0) (note-dependency! acc) (peek-fn))
@@ -134,10 +134,10 @@ matching Gnim's (time (lambda (t) ...)) idiom."
               #:name name))
   acc)
 
-(define (peek acc)
+(define (st-peek acc)
   "Read ACC's value without recording a dependency.  This is the read to use
 inside a procedure that must not be re-run when ACC changes."
-  (unless (accessor? acc) (error "peek: not an accessor" acc))
+  (unless (accessor? acc) (error "st-peek: not an accessor" acc))
   ((slot-ref acc 'peek-fn)))
 
 (define (subscribe acc thunk)
@@ -320,7 +320,7 @@ tear the child down and rebuild it."
          (dispose-inner #f))
 
     (define (changed!)
-      (let ((v (peek inner)))
+      (let ((v (st-peek inner)))
         (unless (and started? (equals last v))
           (set! last v)
           (set! started? #t)
@@ -331,13 +331,13 @@ tear the child down and rebuild it."
       ;; or the first change notifies twice: once for the real change and once
       ;; because there was no baseline to compare against.
       (unless started?
-        (set! last (peek inner))
+        (set! last (st-peek inner))
         (set! started? #t)))
 
     (create-accessor
      (lambda ()
        (sync-baseline!)
-       (peek inner))
+       (st-peek inner))
      name
      #:subscribe-fn
      (lambda (thunk)
@@ -437,7 +437,7 @@ a raw thunk."
 ;;; Contexts
 ;;; ---------------------------------------------------------------------------
 
-(define* (create-context default #:optional (name 'context))
+(define* (st-create-context default #:optional (name 'context))
   "Returns two procedures: (provide value) and (use-context).
 
 A context lets a subtree pass a value down without threading it through every
