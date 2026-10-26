@@ -21,17 +21,22 @@
 (define-module (scheme-toolkit gi)
   #:use-module (oop goops)
   #:use-module (g-golf)
+  #:use-module (g-golf support module)
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
 
-  ;; Re-export the G-Golf surface a shell needs, so that consumers can import
-  ;; this one module instead of both.  `#:re-export' keeps the original
-  ;; bindings rather than copying them.
+  #:duplicates (merge-generics replace warn-override-core warn last)
+
+  ;; Re-export ALL of G-Golf's public interface, so a consumer can import this
+  ;; one module instead of both.
   ;;
-  ;; Only names that (g-golf) itself defines can be listed here.  GI classes
-  ;; such as <gtk-widget> do NOT exist until a namespace is imported, so naming
-  ;; one re-exports an unbound variable and the module fails to load -- which is
-  ;; exactly what happened.  Import Gtk with define-gi-imports to get those.
+  ;; This must be the whole interface, not a hand-picked subset.  G-Golf's
+  ;; importer expands into code that resolves type-tag names -- int32, uint32
+  ;; and friends -- *in the importing module*, so a module that has
+  ;; (scheme-toolkit gi) but not the full (g-golf) surface fails every
+  ;; gi-import-by-name with "Unbound variable: int32", an error that names
+  ;; nothing to do with the real problem.  re-export-public-interface keeps the
+  ;; original bindings (and their generics) rather than copying them.
   #:re-export (gi-import
                gi-import-by-name
                g-irepository-require
@@ -53,6 +58,11 @@
             layer-shell-preloaded?
             astal-supported?
             gi-check))
+
+;; Re-export the whole G-Golf interface.  See the comment in the define-module
+;; form: a hand-picked subset is not enough, because G-Golf's importer resolves
+;; type-tag names in the importing module.
+(re-export-public-interface (g-golf))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 1. Small helpers
@@ -183,30 +193,41 @@ make G-Golf fail silently.  Call this at the top of a shell's entry point."
 
 (define (gi-import-names namespace names)
   "Import each NAME (a symbol or string) from NAMESPACE into the current module.
-Returns the list of names attempted.  Raises a message naming the namespace and
-the type when one cannot be found, which is the usual sign of a missing
-typelib."
+Returns the list of names attempted."
   (for-each (lambda (name)
-              (let ((name (if (symbol? name) (symbol->string name) name)))
-                (catch #t
-                  (lambda () (gi-import-by-name namespace name))
-                  (lambda (key . args)
-                    (error (error-list
-                            (format #f "cannot import ~a.~a" namespace name)
-                            "Is the typelib installed and GI_TYPELIB_PATH set?"))))))
+              (gi-import-by-name namespace
+                                 (if (symbol? name) (symbol->string name) name)))
             names)
   names)
 
+;; The expansion calls gi-import-by-name DIRECTLY rather than through a helper
+;; procedure.  G-Golf's importer expands into code that resolves type-tag names
+;; (int32, uint32, ...) *in the module being imported into*, so wrapping the
+;; call in a procedure defined elsewhere makes those lookups happen in the wrong
+;; module and the import fails with "Unbound variable: int32" -- an error that
+;; names nothing to do with the real problem.
+;;
+;; The (use-modules (g-golf)) inside the expansion is what puts those names in
+;; scope.  It is not redundant with this module's own import: the names have to
+;; be visible in the CALLER's module at expansion time, which is where the
+;; importer looks them up.
 (define-syntax define-gi-imports
   (syntax-rules ()
     "Syntax: (define-gi-imports NAMESPACE NAME ...)
 
 Import just the named types from NAMESPACE at expand/load time, binding the
-usual G-Golf names (<gtk-label>, !label, make, ...) in the calling module."
+usual G-Golf names (<gtk-label>, !label, make, ...) in the calling module.
+
+  (define-gi-imports \"Gtk\" \"Box\" \"Label\")
+
+Selective importing matters: whole-namespace (gi-import \"Gtk\") costs 2.7 s,
+against 0.6 s for the first by-name import and ~0 for the rest."
     ((_ namespace name ...)
      (eval-when (expand load eval)
+       (use-modules (g-golf))
        (g-irepository-require namespace)
-       (gi-import-names namespace '(name ...))))))
+       (gi-import-by-name namespace name)
+       ...))))
 
 (define* (gi-require namespace #:optional version)
   "Make NAMESPACE available to the introspection repository without importing
