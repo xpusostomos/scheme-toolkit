@@ -41,6 +41,7 @@
   #:use-module (srfi srfi-1)
 
   #:export (accessor? accessor-name
+            create-accessor
             peek subscribe as
             create-state create-computed create-memo
             create-effect create-binding create-connection
@@ -110,7 +111,7 @@
   (let ((t (%tracking)))
     (when t (hashq-set! t acc #t))))
 
-(define* (make-accessor peek-fn name #:key (subscribe-fn #f) (version-fn #f))
+(define* (create-accessor peek-fn name #:key (subscribe-fn #f) (version-fn #f))
   "Build an accessor over PEEK-FN.  The one-argument call derives a computed,
 matching Gnim's (time (lambda (t) ...)) idiom."
   (define acc #f)
@@ -183,7 +184,7 @@ The setter notifies only when the value actually changed."
   (let ((value initial)
         (version 0)
         (subs (make-subs)))
-    (let ((acc (make-accessor (lambda () value) 'state
+    (let ((acc (create-accessor (lambda () value) 'state
                               #:version-fn (lambda () version)
                               #:subscribe-fn
                               (lambda (thunk)
@@ -286,7 +287,7 @@ forever after its source becomes 3."
         (recompute!))
       value)
 
-    (make-accessor read name
+    (create-accessor read name
                    #:version-fn (lambda () version)
                    #:subscribe-fn
                    (lambda (thunk)
@@ -333,7 +334,7 @@ tear the child down and rebuild it."
         (set! last (peek inner))
         (set! started? #t)))
 
-    (make-accessor
+    (create-accessor
      (lambda ()
        (sync-baseline!)
        (peek inner))
@@ -529,7 +530,7 @@ leaks a widget tree per replug."
         (catch #t (lambda () (disconnect obj handler-id)) (lambda args #f))
         (set! handler-id #f)))
 
-    (make-accessor
+    (create-accessor
      get
      name
      #:subscribe-fn
@@ -557,7 +558,7 @@ than read from a property."
   (let ((value initial)
         (version 0)
         (subs (make-subs)))
-    (let ((acc (make-accessor
+    (let ((acc (create-accessor
                 (lambda () value)
                 name
                 #:version-fn (lambda () version)

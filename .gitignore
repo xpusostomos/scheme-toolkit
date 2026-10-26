@@ -1,0 +1,19 @@
+.guix-profile*
+.akku
+*.log
+*.o
+*.o?
+*.ostk
+*.bci
+*.bcild
+*.bin
+*.binld
+*.com
+*.comld
+*.ext
+*~
+
+# build artifacts
+.guile-cairo/
+__pycache__/
+*.pyc
