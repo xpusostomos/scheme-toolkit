@@ -41,6 +41,7 @@
   #:use-module (srfi srfi-1)
 
   #:export (accessor? accessor-name <st-accessor>
+            make-subs subs-add! subs-remove! subs-count subs-notify!
             create-accessor
             st-peek subscribe as
             create-state create-computed create-memo

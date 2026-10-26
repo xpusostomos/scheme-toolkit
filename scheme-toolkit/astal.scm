@@ -79,7 +79,17 @@
                     ;; A namespace that is not installed is an ordinary state,
                     ;; not an error: the service simply reports unavailable.
                     #f))))
-            %services))
+            %services)
+  ;; The Hyprland methods this module calls beyond get_default.  get_workspaces
+  ;; is the one that matters: it returns a proper Scheme list where the
+  ;; GList-valued `workspaces' property returns an opaque pointer.
+  (catch #t
+    (lambda ()
+      (g-irepository-require "AstalHyprland")
+      (for-each (lambda (m) (gi-import-by-name "AstalHyprland" m))
+                '("get_workspaces" "get_clients" "get_monitors"
+                  "get_focused_workspace" "get_focused_client")))
+    (lambda args #f)))
 
 (define %instances (make-hash-table))
 
@@ -191,20 +201,116 @@ bang -- because the value lives in WirePlumber, not in this process."
 (define (hyprland-clients)
   (bind-obj (hyprland) "clients" 'clients))
 
-(define (workspaces)
-  "The workspace list, from AstalWorkspace when the compositor supports
-ext-workspace-v1 and from AstalHyprland otherwise.
+;; Workspaces come from AstalHyprland, NOT AstalWorkspace, even though
+;; astal-supported? 'workspace answers #t on this machine.
+;;
+;; AstalWorkspace's `workspaces' property is a GList-valued boxed type, and
+;; G-Golf has no converter for it: both (slot-ref wm 'workspaces) and the
+;; generated getter fail with "Unimplemented boxed type".  The protocol is
+;; there; the binding cannot read it.  AstalHyprland's `workspaces' returns a
+;; GList that G-Golf DOES convert, so the fallback path is the working one and
+;; is what this uses.
+;;
+;; If G-Golf gains a GList boxed-type converter, or AstalWorkspace exposes the
+;; model differently, revisit: AstalWorkspace is the compositor-agnostic answer
+;; and strictly better where it works.
+(define (workspaces-source)
+  "Which object to bind workspaces to.  Kept as a procedure so the choice is in
+one place and visible when it changes."
+  'hyprland)
 
-That fallback is the whole reason this is a procedure rather than a binding:
-which object to bind to is decided at run time."
-  (if (astal-supported? 'workspace)
-      (bind-obj (workspace-manager) "workspaces" 'workspaces)
-      (bind-obj (hyprland) "workspaces" 'workspaces)))
+(define (workspaces)
+  "An accessor over the workspace list.  (st-peek (workspaces)) => a list of
+workspace objects.
+
+NOT a plain create-binding, because `workspaces' is a GList-valued property with
+no notify signal, and (slot-ref h 'workspaces) returns an opaque foreign pointer
+rather than a list.  The METHOD (get-workspaces h) does convert properly -- that
+is the GList handling the plan predicted but which only the method implements.
+
+So this reads through the method and re-reads on Hyprland's `event' signal,
+filtering to the events that change the workspace set.  Re-reading on every
+event would be wasteful: a window title change fires constantly and cannot
+alter the list."
+  (let ((value '())
+        (subs (make-subs))
+        (handler #f))
+
+    (define (read)
+      (catch #t
+        (lambda ()
+          (let ((v (get-workspaces (hyprland))))
+            (if (list? v) v '())))
+        (lambda args '())))
+
+    (define (refresh!)
+      (let ((new (read)))
+        (unless (equal? (map workspace-name new) (map workspace-name value))
+          (set! value new)
+          (subs-notify! subs))))
+
+    (let ((acc (create-accessor read 'workspaces
+                                #:subscribe-fn
+                                (lambda (thunk)
+                                  (subs-add! subs thunk)
+                                  (unless handler
+                                    (set! value (read))
+                                    (set! handler
+                                          (connect (hyprland) 'event
+                                                   (lambda (h event args)
+                                                     (when (workspace-event? event)
+                                                       (refresh!))))))
+                                  (lambda ()
+                                    (subs-remove! subs thunk)
+                                    (when (and handler (zero? (subs-count subs)))
+                                      (catch #t (lambda () (disconnect (hyprland) handler))
+                                             (lambda a #f))
+                                      (set! handler #f)))))))
+      acc)))
+
+(define (workspace-name ws)
+  (catch #t (lambda () (slot-ref ws 'name)) (lambda args #f)))
+
+;; Hyprland event names, from the hyprland socket2 protocol.  Only these can
+;; change which workspaces exist or which one is focused; `activewindow' and
+;; `windowtitle' fire constantly and cannot.
+(define %workspace-events
+  '("workspace" "workspacev2" "createworkspace" "createworkspacev2"
+    "destroyworkspace" "destroyworkspacev2" "moveworkspace" "moveworkspacev2"
+    "renameworkspace" "activespecial" "focusedmon"))
+
+(define (workspace-event? event)
+  (and (string? event) (member event %workspace-events) #t))
 
 (define (focused-workspace)
-  (if (astal-supported? 'workspace)
-      (bind-obj (workspace-manager) "focused-workspace" 'focused-workspace)
-      (bind-obj (hyprland) "focused-workspace" 'focused-workspace)))
+  "An accessor over the focused workspace object.
+
+`focused-workspace' reads through the property directly because it is an OBJECT
+(unlike the GList list), and G-Golf converts objects fine.  It is refreshed on
+the same events that move focus."
+  (let ((subs (make-subs))
+        (handler #f))
+    (define (read)
+      (catch #t (lambda () (slot-ref (hyprland) 'focused-workspace))
+             (lambda args #f)))
+    (define (refresh!)
+      (subs-notify! subs))
+    (create-accessor read 'focused-workspace
+                     #:subscribe-fn
+                     (lambda (thunk)
+                       (subs-add! subs thunk)
+                       (unless handler
+                         (set! handler
+                               (connect (hyprland) 'event
+                                        (lambda (h event args)
+                                          (when (workspace-event? event)
+                                            (refresh!))))))
+                       (lambda ()
+                         (subs-remove! subs thunk)
+                         (when (and handler (zero? (subs-count subs)))
+                           (catch #t (lambda () (disconnect (hyprland) handler))
+                                  (lambda a #f))
+                           (set! handler #f)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Diagnostics
