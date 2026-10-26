@@ -94,21 +94,43 @@
 ;; GtkApplication -> gtk-application; AstalWindow -> astal-window.
 ;; Used to predict the Scheme name of an imported type so a failure can name it.
 (define (camel->kebab name)
+  "CamelCase (and snake_case) to kebab-case.
+
+A dash goes before an uppercase letter only when it follows a lowercase letter,
+so the IO in AstalIO does not produce a double dash.  Underscores become dashes,
+because a C identifier such as astal_workspace_is_supported is bound as
+astal-workspace-is-supported -- leaving the underscores in place gives a name
+that is simply not bound, and the failure is a bare \"No variable named\"."
   (let loop ((chars (string->list name)) (out '()) (prev-lower #f))
     (cond ((null? chars) (list->string (reverse out)))
+          ((char=? (car chars) #\_)
+           (loop (cdr chars) (cons #\- out) #f))
           ((char-upper-case? (car chars))
            (loop (cdr chars)
                  (cons (char-downcase (car chars))
                        (if prev-lower (cons #\- out) out))
                  #f))
           (else
-           (loop (cdr chars) (cons (car chars) out) #t)))))
+           (loop (cdr chars) (cons (car chars) out)
+                 (char-lower-case? (car chars)))))))
 
-(define (gi-scheme-name namespace type-name)
-  "The Scheme name G-Golf will bind for TYPE-NAME in NAMESPACE:
-(g-golf-name \"Astal\" \"Window\") => astal-window."
+;; G-Golf derives a Scheme name from the C identifier, which is the namespace
+;; prefix joined to the member's own name.  A CLASS is bound as
+;; <ns-type>, but a FUNCTION is bound as ns-fn with no angle brackets -- so
+;; AstalWorkspace's is_supported is `astal-workspace-is-supported', not
+;; `astal-workspaceis-supported'.  Concatenating before converting, which is the
+;; obvious thing to write, gets the function case wrong.
+(define (gi-class-name namespace type-name)
+  "The Scheme name G-Golf binds for a class: (gi-class-name \"Astal\" \"Window\")
+=> <astal-window>."
   (string->symbol
-   (camel->kebab (string-append namespace type-name))))
+   (string-append "<" (camel->kebab (string-append namespace type-name)) ">")))
+
+(define (gi-function-name namespace fn-name)
+  "The Scheme name G-Golf binds for a function: (gi-function-name \"AstalWorkspace\"
+\"is_supported\") => astal-workspace-is-supported."
+  (string->symbol
+   (string-append (camel->kebab namespace) "-" (camel->kebab fn-name))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 2. Environment assertions
@@ -276,19 +298,49 @@ anything from it."
   '((workspace   . "AstalWorkspace")
     (idle-notify . "AstalIdleNotify")))
 
+;; The predicate procedures, captured as VALUES at load time.
+;;
+;; Looking the name up later does not work reliably.  gi-import-by-name binds
+;; into whatever module is current when it runs, and inside a compiled procedure
+;; called from elsewhere `current-module' is not dependably this one -- so the
+;; import and the module-ref can end up addressing different modules and the
+;; lookup fails with no clue why.  Capturing the procedure here, once, in the
+;; same module that did the importing, sidesteps the question entirely.
+(define %support-procs (make-hash-table))
+
+(eval-when (load eval)
+  (for-each (lambda (entry)
+              (let ((feature (car entry)) (ns (cdr entry)))
+                (catch #t
+                  (lambda ()
+                    (g-irepository-require ns)
+                    (gi-import-by-name ns "is_supported")
+                    (hashq-set! %support-procs feature
+                                (module-ref (resolve-module '(scheme-toolkit gi))
+                                            (gi-function-name ns "is_supported"))))
+                  ;; A namespace that is not installed is an ordinary state, not
+                  ;; an error: the feature simply reports unsupported.
+                  (lambda (key . args)
+                    (format (current-error-port)
+                            "scheme-toolkit: ~a support probe failed: ~a ~s~%"
+                            ns key args)
+                    #f))))
+            %supported-namespaces))
+
 (define (astal-supported? feature)
   "Return #t if the compositor behind FEATURE ('workspace or 'idle-notify)
-supports the protocol.  Returns #f if the namespace is absent altogether."
-  (let ((ns (assq-ref %supported-namespaces feature)))
-    (unless ns
+supports the protocol.  Returns #f if the namespace is absent altogether.
+
+Each of these namespaces exports an <ns>_is_supported() function, which asks
+the compositor whether it implements the protocol -- ext-workspace-v1 for
+workspaces, ext-idle-notify-v1 for idle.  A shell should ask rather than
+assume: Hyprland 0.56 supports both, but a shell that hardcodes the
+AstalWorkspace path breaks on a compositor that only offers AstalHyprland."
+  (let ((p (hashq-ref %support-procs feature)))
+    (unless (assq feature %supported-namespaces)
       (error "astal-supported?: unknown feature" feature))
     (catch #t
-      (lambda ()
-        (g-irepository-require ns)
-        ;; Each of these namespaces exports <ns>_is_supported().
-        (gi-import-by-name ns "is_supported")
-        (let ((p (module-ref (current-module) (gi-scheme-name ns "is_supported"))))
-          (and (procedure? p) (p))))
+      (lambda () (and p (procedure? p) (p)))
       (lambda args #f))))
 
 ;;; ---------------------------------------------------------------------------
