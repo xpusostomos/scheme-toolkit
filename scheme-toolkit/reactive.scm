@@ -42,10 +42,12 @@
 
   #:export (accessor? accessor-name <st-accessor>
             make-subs subs-add! subs-remove! subs-count subs-notify!
+            create-binding
+            create-binding-path
             create-accessor
             st-peek subscribe as
             create-state create-computed create-memo
-            create-effect create-binding create-connection
+            create-effect create-connection
             create-root dispose-root
             on-cleanup on-mount
             get-scope with-scope
@@ -504,11 +506,36 @@ from leaking them across re-runs."
 ;;; create-binding -- reactive reads of GObject properties
 ;;; ---------------------------------------------------------------------------
 
+(define (binding-getter-value obj prop)
+  "Read PROP from OBJ, or #f if it cannot be read.
+
+#f rather than an error, because create-binding-path walks chains that legitimately
+break in the middle -- a machine with no wireless card has no `wifi' device to
+read an `ssid' from."
+  (let* ((prop (if (string? prop) prop (symbol->string prop)))
+         (sym (string->symbol prop)))
+    (cond
+     ((catch #t (lambda () (slot-exists? obj sym) #t) (lambda args #f))
+      (catch #t (lambda () (slot-ref obj sym)) (lambda args #f)))
+     (else
+      ;; Not every property has a generated accessor slot; get-<prop> is the
+      ;; fallback.
+      (let ((getter (string->symbol (string-append "get-" prop))))
+        (catch #t
+          (lambda ()
+            (when (module-bound? (current-module) getter)
+              ((module-ref (current-module) getter) obj)))
+          (lambda args #f)))))))
+
 (define (binding-getter obj prop)
-  (let ((sym (string->symbol prop)))
-    (or (and (slot-exists? obj sym) (lambda () (slot-ref obj sym)))
-        ;; Not every property has a generated accessor slot; get-<prop> is the
-        ;; fallback.
+  "A thunk reading PROP from OBJ, or an error if the property does not exist.
+
+This is create-binding's version, which is strict: a single-property binding
+that cannot read its property is a bug worth raising.  (create-binding-path is
+the lenient one, because its chains are allowed to break.)"
+  (let ((sym (string->symbol (if (string? prop) prop (symbol->string prop)))))
+    (or (and (catch #t (lambda () (slot-exists? obj sym) #t) (lambda args #f))
+             (lambda () (slot-ref obj sym)))
         (let ((getter (string->symbol (string-append "get-" prop))))
           (and (module-bound? (current-module) getter)
                (lambda () ((module-ref (current-module) getter) obj))))
@@ -547,6 +574,106 @@ leaks a widget tree per replug."
          (subs-remove! subs thunk)
          (when (zero? (subs-count subs))
            (drop-handler!)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; create-binding-path
+;;; ---------------------------------------------------------------------------
+
+;; GObject properties frequently form a chain that can break in the middle: the
+;; network's `wifi' device, the wifi device's `active-access-point', and the
+;; access point's `ssid'.  Binding to `wifi' only tells you when the DEVICE
+;; changes, not when its SSID does -- that is a property of the device.
+;;
+;; Following the chain needs two things a plain create-binding does not do:
+;; tolerate a #f link (a machine with no wireless card), and MOVE its
+;; subscription when an intermediate object is replaced.
+;;
+;; A step is either a property name (a string) or a PROCEDURE that selects the
+;; next object from the current one.  The procedure form is what a list needs:
+;; MPRIS exposes `players' as a list, and the metadata lives on the first player,
+;; so ("players" first-player "title") is the path.  There is no property to
+;; subscribe to for the selection itself -- the notification on the step BEFORE
+;; it covers that -- so a procedure step descends without subscribing.
+(define (path-step obj step)
+  (cond ((not obj) #f)
+        ((procedure? step) (step obj))
+        ((string? step) (binding-getter-value obj step))
+        (else (binding-getter-value obj (symbol->string step)))))
+
+(define (path-step-property step)
+  "The property name a step subscribes to, or #f for a selector."
+  (cond ((string? step) step)
+        ((symbol? step) (symbol->string step))
+        (else #f)))
+
+(define (path-read obj path)
+  "Read PATH from OBJ, returning #f the moment a link is missing."
+  (let loop ((o obj) (rest path))
+    (cond ((null? rest) o)
+          (else (loop (path-step o (car rest)) (cdr rest))))))
+
+(define* (create-binding-path obj path #:optional (name 'binding-path))
+  "An accessor over a chain of GObject properties, null-safely.
+
+  (create-binding-path (network) '(\"wifi\" \"ssid\"))
+  (create-binding-path (mpris) (list \"players\" first-player \"title\"))
+
+A step is a property name or a procedure selecting the next object.  The chain
+may break anywhere and yields #f there rather than an error, which is what makes
+it usable on hardware that may not have the device, and on a session with no
+media player running.
+
+Subscribes along the whole chain and re-subscribes when an intermediate object
+changes, so replacing the device -- or the player -- is noticed."
+  (let* ((subs (make-subs))
+         (chain '()))                  ; (obj . handler-id), current subscriptions
+
+    (define (read) (path-read obj path))
+
+    (define (drop-chain!)
+      (for-each (lambda (entry)
+                  (catch #t (lambda () (disconnect (car entry) (cdr entry)))
+                         (lambda args #f)))
+                chain)
+      (set! chain '()))
+
+    (define (subscribe-chain!)
+      ;; Walk the path, subscribing to notify::<prop> on each object we can
+      ;; reach.  Re-done on every notification, because one may mean the object
+      ;; below it was replaced and our subscription now points at a dead one.
+      (drop-chain!)
+      (let loop ((o obj) (rest path))
+        (when (and o (pair? rest))
+          (let ((prop (path-step-property (car rest))))
+            (when prop
+              (let ((id (catch #t
+                          (lambda ()
+                            (connect o (string->symbol (string-append "notify::" prop))
+                                     (lambda (changed . ignored)
+                                       ;; Re-subscribe FIRST: the chain may have
+                                       ;; moved, and waiting until after the
+                                       ;; notify would miss a change in between.
+                                       (subscribe-chain!)
+                                       (subs-notify! subs))))
+                          (lambda args #f))))
+                (when id (set! chain (cons (cons o id) chain)))))
+            ;; Descend regardless: a selector step has nothing to subscribe to,
+            ;; but the step after it does.
+            (loop (path-step o (car rest)) (cdr rest))))))
+
+    (create-accessor
+     read
+     name
+     #:subscribe-fn
+     (lambda (thunk)
+       (subs-add! subs thunk)
+       (when (= 1 (subs-count subs))
+         (subscribe-chain!)
+         (on-cleanup drop-chain!))
+       (lambda ()
+         (subs-remove! subs thunk)
+         (when (zero? (subs-count subs))
+           (drop-chain!)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; create-connection

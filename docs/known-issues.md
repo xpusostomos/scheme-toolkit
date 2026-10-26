@@ -122,3 +122,23 @@ Not a blocker: a widget binds to a *property*, and GObject supplies
 `notify::` for a declared property with no help at all. A shell service in this
 toolkit therefore exposes state as properties and only declares signals for
 external code to subscribe to.
+
+## Writing a double quote inside a docstring
+
+Twice now, and it is worth its own entry because the error points at the wrong
+place:
+
+    (define (first-player players)
+      "Whichever player MPRIS lists first is the one to show, rather than
+    tracking an "active" player."
+      ...)
+
+The `"active"` **ends the string**. Everything after it is read as code, so the
+definition acquires stray identifiers and the failure is
+
+    media.scm:32:34: In procedure media-widget: Unbound variable: active
+
+-- naming a variable that appears nowhere as a variable. The same thing bit
+`run-shell`'s docstring earlier, in a different file.
+
+Avoid a bare `"` in a docstring. Rephrase, or use `\"`.
