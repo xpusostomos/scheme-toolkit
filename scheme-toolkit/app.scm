@@ -27,7 +27,7 @@
   #:export (run-shell quit-shell
             app-instance
             layer-window window-set-anchored!
-            windows window windows-named window-visible?
+            windows window windows-named window-names window-visible?
             toggle-window
             monitors for-each-monitor monitor-name monitor-geometry
             on-monitors-changed
@@ -140,6 +140,16 @@ them."
 (define (windows)
   "Every registered window, newest first."
   (map cdr %windows))
+
+(define (window-names)
+  "The distinct names in the registry, in registration order.
+
+Several windows can share a name -- one per monitor -- which is why this returns
+names rather than windows: it is the list of things toggle-window can act on."
+  (let loop ((rest %windows) (seen '()))
+    (cond ((null? rest) (reverse! seen))
+          ((member (caar rest) seen) (loop (cdr rest) seen))
+          (else (loop (cdr rest) (cons (caar rest) seen))))))
 
 (define (window-visible? w)
   (catch #t (lambda () (slot-ref w 'visible)) (lambda args #f)))
@@ -334,16 +344,17 @@ Returns the application's exit status."
 
 Resolved at run time rather than imported, so that a shell works even when that
 module is not on the load path -- it is a development affordance, not a
-dependency."
+dependency.
+
+resolve-interface, NOT resolve-module.  resolve-module does not LOAD a module
+from disk; with its default #:ensure #t it hands back a fresh empty one, and with
+#:ensure #f it returns #f for anything not already loaded.  Both look like
+\"the module is missing\", so the REPL silently never started.  resolve-interface
+is what use-modules itself uses, and it loads."
   (catch #t
     (lambda ()
-      (let ((m (resolve-module '(scheme-toolkit repl) #:ensure #f)))
-        (if m
-            ((module-ref m 'start-repl!) #:instance instance)
-            (begin
-              (format (current-error-port)
-                      "scheme-toolkit: (scheme-toolkit repl) not found; no back door~%")
-              #f))))
+      (let ((iface (resolve-interface '(scheme-toolkit repl))))
+        ((module-ref iface 'start-repl!) #:instance instance)))
     (lambda (key . args)
       (format (current-error-port) "scheme-toolkit: REPL not started: ~a ~s~%"
               key args)
