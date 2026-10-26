@@ -1,0 +1,110 @@
+#!/bin/bash
+# bin/scheme-toolkit -- the single entry point for running and talking to a
+# scheme-toolkit shell.
+#
+# Every subcommand establishes the same environment first.  That is not
+# convenience: the environment is load-bearing.  Without LD_PRELOAD the
+# layer-shell calls silently no-op, and without the two paths GI silently
+# imports Astal in enums-only mode.  Both failures look like ordinary
+# programming bugs from inside Guile, so the wrapper owns them.
+#
+#   run <dir|file> [args]   start a shell (sets up env, execs guile)
+#   eval EXPR...            evaluate expressions in a running shell
+#   repl                    interactive REPL into a running shell
+#   list                    list running instances
+#   check-env               diagnose the environment
+#   guile ARGS...           run guile with the right env and load path
+#
+# The instance name defaults to $SCHEME_TOOLKIT_INSTANCE, then to the directory
+# name a shell was started from.
+
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+TOOLKIT_ROOT="$(dirname "$(dirname "$SELF")")"
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-}"
+
+# Astal installs to /usr/local and is not in the ldconfig cache.
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GI_TYPELIB_PATH="/usr/local/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+
+# libgtk4-layer-shell must be preloaded for Astal.Window to work at all.  Keep
+# any existing preload entries and prepend ours.
+LAYER_SHELL="libgtk4-layer-shell.so"
+case "${LD_PRELOAD:-}" in
+    *"$LAYER_SHELL"*) ;;
+    *) export LD_PRELOAD="$LAYER_SHELL${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+esac
+
+die() { echo "scheme-toolkit: $*" >&2; exit 1; }
+
+runtime_dir() {
+    [ -n "$RUNTIME_BASE" ] || die "XDG_RUNTIME_DIR is unset; refusing to use a world-writable socket path"
+    local d="$RUNTIME_BASE/scheme-toolkit"
+    mkdir -p "$d"
+    chmod 700 "$d"
+    printf '%s' "$d"
+}
+
+# Load path for our own modules: every subproject in the checkout contributes.
+load_args() {
+    printf -- '-L %s' "$TOOLKIT_ROOT/scheme-toolkit"
+    # Sibling subprojects, so scheme-desktop finds (scheme-desktop ...) and
+    # scheme-toolkit is found from anywhere in the tree.
+    for d in "$TOOLKIT_ROOT"/*/; do
+        [ -d "$d" ] || continue
+        case "$(basename "$d")" in
+            scheme-toolkit|tools|bin|docs|tests|examples) ;;
+            *) [ -d "${d}$(basename "$d")" ] && printf -- ' -L %s' "${d}" ;;
+        esac
+    done
+}
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+    run)
+        [ $# -ge 1 ] || die "run: needs a file or directory"
+        target="$1"; shift || true
+        if [ -d "$target" ]; then
+            # A shell directory: look for the conventional entry point.
+            for cand in "$target/main.scm" "$target/shell.scm"; do
+                [ -f "$cand" ] && { target="$cand"; break; }
+            done
+        fi
+        [ -f "$target" ] || die "run: no such file: $target"
+        target="$(readlink -f "$target")"
+        : "${SCHEME_TOOLKIT_INSTANCE:=$(basename "$(dirname "$target")")}"
+        export SCHEME_TOOLKIT_INSTANCE
+        exec guile $(load_args) -e main -s "$target" "$@"
+        ;;
+
+    eval)
+        [ $# -ge 1 ] || die "eval: needs an expression"
+        exec guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" eval "$@"
+        ;;
+
+    repl)
+        exec guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" repl
+        ;;
+
+    list)
+        exec guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" list
+        ;;
+
+    check-env)
+        exec guile $(load_args) -s "$TOOLKIT_ROOT/tools/check-env.scm" "$@"
+        ;;
+
+    guile)
+        exec guile $(load_args) "$@"
+        ;;
+
+    ""|-h|--help|help)
+        sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'
+        ;;
+
+    *)
+        die "unknown subcommand: $cmd (try --help)"
+        ;;
+esac
