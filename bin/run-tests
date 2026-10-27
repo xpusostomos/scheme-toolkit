@@ -1,0 +1,82 @@
+#!/bin/sh
+# bin/run-tests -- run every suite in this checkout and in a sibling
+# scheme-desktop, and fail if any of them does.
+#
+# Why this exists rather than a Makefile: the suites are separate Guile
+# processes (each needs a fresh GTK), and the check that matters is not the
+# exit status but the SUMMARY LINE.  A srfi-64 suite that ABORTS partway
+# reports no failures for every group after the abort point -- the same green
+# as success.  Only "*** # of expected passes" distinguishes them, and nobody
+# reads the tail of a passing run.  That is not hypothetical: three bugs in the
+# element runtime hid behind one raise that made the file abort early.
+#
+# Usage:
+#   bin/run-tests              this checkout only
+#   bin/run-tests --with-desktop   also run ../scheme-desktop/tests
+#   bin/run-tests tests/style.scm  just these
+
+set -u
+
+SELF="$(readlink -f "$0")"
+ROOT="$(dirname "$(dirname "$SELF")")"
+STK="$ROOT/bin/scheme-toolkit"
+
+with_desktop=0
+files=""
+for arg in "$@"; do
+    case "$arg" in
+        --with-desktop) with_desktop=1 ;;
+        *) files="$files $arg" ;;
+    esac
+done
+
+if [ -z "$files" ]; then
+    files="$(ls "$ROOT"/tests/*.scm 2>/dev/null)"
+    if [ "$with_desktop" = 1 ]; then
+        desktop="$(dirname "$ROOT")/scheme-desktop/tests"
+        files="$files $(ls "$desktop"/*.scm 2>/dev/null)"
+    fi
+fi
+
+total_pass=0
+total_fail=0
+bad=""
+
+for f in $files; do
+    out="$("$STK" guile -s "$f" 2>&1)"
+    pass=$(printf '%s\n' "$out" | grep -c '^\* PASS')
+    fail=$(printf '%s\n' "$out" | grep -c '^\* FAIL')
+    skip=$(printf '%s\n' "$out" | grep -c '^\* SKIP')
+    # The summary line is the real test.  Without it the file aborted.
+    #
+    # A suite that SKIPPED its only group prints no summary line either --
+    # srfi-64 omits it when nothing ran -- and a skip is not a failure.  The
+    # live-shell suite skips by design when no shell is listening, so treating
+    # that as an abort would make the runner useless exactly when a developer
+    # runs it without a shell up.
+    if printf '%s\n' "$out" | grep -q 'expected passes'; then
+        done_mark="ok"
+    elif printf '%s\n' "$out" | grep -q 'LIVE-SHELL SKIPPED'; then
+        done_mark="skipped"
+    else
+        done_mark="ABORTED"
+        fail=$((fail + 1))
+    fi
+    [ "$skip" != 0 ] && [ "$done_mark" = "ok" ] && done_mark="ok (${skip} skipped)"
+    total_pass=$((total_pass + pass))
+    total_fail=$((total_fail + fail))
+    printf '%-40s pass=%-4s fail=%-3s %s\n' "$(basename "$f")" "$pass" "$fail" "$done_mark"
+    if [ "$fail" != 0 ]; then
+        bad="$bad $f"
+        printf '%s\n' "$out" | grep -A3 '^\* FAIL' | head -20
+    fi
+done
+
+printf '\n'
+printf 'total: %s passed, %s failed\n' "$total_pass" "$total_fail"
+
+if [ -n "$bad" ]; then
+    printf 'failing suites:%s\n' "$bad"
+    exit 1
+fi
+exit 0
