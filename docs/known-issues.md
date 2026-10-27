@@ -645,3 +645,43 @@ a `set-*`/`add-*`/`append` GTK call in a conditional.
 
 The same shape as `gtk-window-set-interactive-debugging` elsewhere in this file:
 a void C call reached from Scheme where a value is expected.
+
+## OPEN: Gio.DBusMenuModel drops items from a tray menu
+
+**Measured against Syncthing's own menu.** The application publishes eleven
+nodes on `com.canonical.dbusmenu`:
+
+    Open Syncthing, Settings, Rescan all, Log,
+    Show internal errors, Show notifications/errors,
+    Connection -> (Primary instance), About,
+    ───── separator ─────
+    Close
+
+Read straight off D-Bus:
+
+    gdbus call --session --dest :1.6681 --object-path /MenuBar \
+      --method com.canonical.dbusmenu.GetLayout 0 5 "[]"
+    # 10 labels (Primary instance is a child of Connection), 1 separator
+
+`Gio.DBusMenuModel` -- the model AstalTray hands out as `menu-model`, and the
+one every tray host reads -- reports **8 items and no separator**:
+
+    (get-n-items (item-menu-model item))   ; => 8
+    (menu-item-section model 0)            ; => #f -- no section link at all
+
+So `Close` and the dividing rule **never reach the widget builder**. They are
+not filtered out by this toolkit: they are absent from the model.
+
+**Why it matters.** ags2-shell builds its menus from the same Gio model, so a
+correctly-ported builder still cannot draw those two nodes. This is a limit of
+the Gio model, not of the port -- which is worth knowing before spending more
+time on the builder.
+
+**The route that would work**, if this matters: read the menu over D-Bus
+directly with `GetLayout` and walk the returned tree, rather than going through
+`gio.DBusMenuModel`. That is what the `gdbus` call above does, and it is the
+only way to see the whole menu. It is a real piece of work -- a variant walker
+for `(ia{sv}av)` -- and it belongs in `(scheme-toolkit dbus)`, not in the tray.
+
+**Not yet done.** Recorded so the next reader does not re-derive it from a
+screenshot comparison.
