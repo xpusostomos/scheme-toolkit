@@ -81,6 +81,90 @@ by instance this project wants. `client.scm` needs `repl-port-files` and
 `repl-connect` adapted to `.sock` files under `$XDG_RUNTIME_DIR/scheme-toolkit/`.
 
 
+## Four bugs that a `catch` hid, found by grepping compiler warnings
+
+`guild compile` warns "possibly unbound variable" for a name the module never
+imports. Every module here loads fine without one, so the warnings were only
+worth reading *because* four of them were real — and all four were silent,
+because each sat inside a `catch` that turned "this name does not exist" into a
+plausible-looking `#f`.
+
+The check, which is now worth running after any change to a module's imports:
+
+    for f in $(find scheme-toolkit -name '*.scm'); do
+      GUILE_AUTO_COMPILE=0 guild compile -o /tmp/c.go -L . "$f"
+    done 2>&1 | grep unbound
+
+Ignore `for-each`, `map`, `connect`, `member`, `max` — G-Golf overrides those
+deliberately (see the duplicate-binding handler in `gi.scm`).
+
+| Name | Where | What it silently did |
+|---|---|---|
+| `g-unsetenv` | `app.scm` | Never ran. The binding is the bare `unsetenv`, and `LD_PRELOAD` was therefore **never cleared**, so every app the shell launched inherited the layer-shell preload — the exact failure the function exists to prevent |
+| `get-string-all` | `process.scm` | `exec-async` read nothing from its pipe, so children were never drained and could block on a full pipe |
+| `set-interactive-debugging` | `app.scm` | The inspector never opened. The binding is `gtk-window-set-interactive-debugging`; the wrong name raised inside the `catch`, which reported "cannot open the inspector" and made it look broken rather than misspelt |
+| `wp-default` | DESKTOP `volume.scm` | The volume button's click handler raised on every click — muting from the bar never worked |
+
+**Three lessons.**
+
+1. **A `catch` around a name that might not exist converts a load-time error
+   into a runtime no-op.** That is the right shape for an *external* failure
+   (no audio server, no inspector) and the wrong shape for a misspelt import.
+   The distinguishing question is whether the body can fail for a reason other
+   than "the code is wrong" — if not, let it raise.
+2. **`catch` should report what it caught.** Two of these four were invisible
+   for exactly one reason: the handler returned `#f` and said nothing.
+3. **Compile warnings are worth reading even when the program runs**, because a
+   program that runs is not the same as a program that does its job.
+
+A fourth, unrelated: DESKTOP's `volume.scm` used `<gtk-button>` without
+importing it — it worked only because another module's import reached the same
+module graph. `define-gi-imports` per module is the rule; the same grep catches
+it.
+
+## `guile -e main -s FILE` passes main one argument
+
+`(define (main) ...)` is the natural thing to write in an entry-point file and
+fails at startup with
+
+    In procedure main: Wrong number of arguments to #<procedure main ()>
+
+after every module has loaded, which reads like a deeper problem than it is.
+`guile` calls `main` with **one** argument: the script's command line as a list
+of strings. The fix is `(define (main . args) ...)`.
+
+## A WirePlumber property lags its own write by a DBus round trip
+
+**Symptom.** Toggling mute twice in a row in the same event-loop turn returns
+`(#t #t)`:
+
+    (list (speaker-mute-toggle!) (speaker-mute-toggle!))   ; => (#t #t)
+
+and the sink ends up muted, having never been unmuted.
+
+**Cause, and why it is not a bug in `speaker-mute-toggle!`.** `AstalWp`'s
+`mute` property is a *proxy* for state that lives in WirePlumber. Writing it
+sends a DBus message; `get_mute` keeps answering the previous value until the
+reply and the resulting `notify` come back. The second call therefore reads the
+value from *before* the first call, decides "not muted", and mutes again.
+
+Measured, with a 300 ms main-loop pump between the calls:
+
+    before  #t
+    toggle  -> #f
+    after   #f        ; the round trip landed
+    toggle  -> #t
+    after   #t
+
+**Why this does not affect the shell.** A click, a keybinding or a test step are
+separate main-loop iterations, so the round trip lands between them. The failure
+needs two toggles in one turn, which real input cannot produce.
+
+**If a caller ever needs determinism** -- a script issuing several volume
+commands in a row -- the answer is to wait for the `notify::mute` signal, or to
+set an explicit state rather than toggling. Somebody adding an
+`mute-set!`-style command should read this first.
+
 ## G-Golf's `define-class` is fussy about class options
 
 Three things, all found while building `define-service`, two of which produce

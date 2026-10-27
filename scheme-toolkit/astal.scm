@@ -24,10 +24,11 @@
   #:export (service-instance
             hyprland battery network bluetooth wp mpris tray notifd
             power-profiles workspace-manager brightness cava
+            wp-default
             ;; convenience accessors, bound to a property and returning an
             ;; accessor that a widget can drop straight into #:label
             battery-percentage battery-charging? battery-state
-            speaker-volume speaker-muted? speaker-volume-set!
+            speaker-volume speaker-muted? speaker-volume-set! speaker-mute-toggle!
             microphone-volume microphone-muted?
             hyprland-focused-client hyprland-clients
             workspaces focused-workspace
@@ -188,6 +189,21 @@ bang -- because the value lives in WirePlumber, not in this process."
   (let ((sink (wp-default "default-speaker")))
     (when sink
       (catch #t (lambda () (slot-set! sink 'volume v)) (lambda args #f)))))
+
+(define (speaker-mute-toggle!)
+  "Flip the default sink's mute flag.  Returns the new state, or #f.
+
+A COMMAND, like speaker-volume-set!: the flag lives in WirePlumber, and reading
+it back here would report a stale value until the notify arrives.  The new
+state is what was written, which is what a caller wants to report."
+  (let ((sink (wp-default "default-speaker")))
+    (and sink
+         (catch #t
+           (lambda ()
+             (let ((muted (not (slot-ref sink 'mute))))
+               (slot-set! sink 'mute muted)
+               muted))
+           (lambda args #f)))))
 
 (define (microphone-volume)
   (bind-obj (wp-default "default-microphone") "volume" 'microphone-volume))

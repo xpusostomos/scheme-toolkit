@@ -68,9 +68,14 @@
 ;; from a shell menu would then load libgtk4-layer-shell into its own GTK --
 ;; which either does nothing or misbehaves, and is very hard to trace back here.
 ;; AGS does this at lib/gtk4/app.ts:21 and colorshell at app.ts:125.
+;;
+;; Guile's own `unsetenv', not a GLib import: G-Golf binds GLib's as the bare
+;; name `unsetenv', which is the binding Guile already has, and the import
+;; would shadow it for no gain.  Guile's version also updates the environment
+;; children actually inherit -- verified with `printenv' in a pipe.
 (define (unset-layer-shell-preload!)
   (catch #t
-    (lambda () (g-unsetenv "LD_PRELOAD"))
+    (lambda () (unsetenv "LD_PRELOAD") #t)
     (lambda args #f)))
 
 ;;; ---------------------------------------------------------------------------
@@ -267,14 +272,20 @@ monitors that have gone are disposed."
 ;;; ---------------------------------------------------------------------------
 
 (define (inspect)
-  "Open GTK's interactive inspector on the running shell."
+  "Open GTK's interactive inspector on the running shell.
+
+The binding is gtk-window-set-interactive-debugging, NOT
+set-interactive-debugging: G-Golf names a namespace function after its C
+identifier with the prefix kept.  The wrong name raised inside this procedure's
+catch and was reported as \"cannot open the inspector\", so the inspector looked
+broken rather than misspelt.  It also returns NO values, which is why the call is
+sequenced with begin rather than followed by one."
   (catch #t
     (lambda ()
-      (set-interactive-debugging #t)
-      #t)
+      (begin (gtk-window-set-interactive-debugging #t) #t))
     (lambda (key . args)
-      (format (current-error-port) "scheme-toolkit: cannot open the inspector: ~a~%"
-              (car args))
+      (format (current-error-port) "scheme-toolkit: cannot open the inspector: ~a ~s~%"
+              key args)
       #f)))
 
 (define* (run-shell #:key (instance "shell") (main #f) (repl? #t))

@@ -278,10 +278,18 @@ anything from it."
     ;; Adwaita needs an explicit init when the application is not an
     ;; Adw.Application -- and ours never is, because layer-shell windows need
     ;; Gtk.Application.  AGS does the same thing for the same reason.
+    ;;
+    ;; Imported here rather than tested for: the 1.6 s cost in the header is
+    ;; importing the Adw WIDGET namespaces, and requiring the typelib plus one
+    ;; function measures under a millisecond.  An earlier version tested
+    ;; (module-bound? (current-module) 'adw-init) -- which is #f unless the
+    ;; CALLER has already imported Adw -- so adw-init never ran and the first
+    ;; Adw widget a shell made was uninitialised.
     (catch #t
       (lambda ()
-        (when (module-bound? (current-module) 'adw-init)
-          (adw-init)))
+        (g-irepository-require "Adw" #:version "1")
+        (gi-import-by-name "Adw" "init")
+        (adw-init))
       (lambda args #f)))
   %gtk-initialised?)
 

@@ -27,6 +27,9 @@
   #:use-module (oop goops)
   #:use-module (ice-9 popen)
   #:use-module (ice-9 rdelim)
+  ;; get-string-all is (ice-9 textual-ports) in Guile 3, and its absence was
+  ;; hidden by a catch: exec-async silently read nothing.
+  #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 threads)
   #:use-module (ice-9 format)
   #:use-module (srfi srfi-13)
