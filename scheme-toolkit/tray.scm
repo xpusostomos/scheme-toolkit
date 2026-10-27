@@ -49,6 +49,26 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
   #:use-module (srfi srfi-13)
+
+  ;; MANDATORY, and its absence is subtle.  With merge-generics, importing
+  ;; (scheme-toolkit gi) MERGES GI's generics with Guile's own procedures of the
+  ;; same name -- `connect' gains GObject signal methods alongside the socket
+  ;; one, `append' gains GtkBox's, and so on.
+  ;;
+  ;; WITHOUT THIS DECLARATION the module keeps whatever `connect' Guile core
+  ;; provides, so `(connect button 'clicked proc)' dispatches to the SOCKET
+  ;; connect and fails with
+  ;;
+  ;;   Wrong type argument in position 1 (expecting open file port): #<gtk-button>
+  ;;
+  ;; which names a file port and mentions no signal, no widget and no module.
+  ;; It works in every isolated test -- because those import (scheme-toolkit
+  ;; widget) or (scheme-toolkit gi) first -- and fails only here.
+  ;;
+  ;; gi.scm and widget.scm both declare it; every module that imports gi AND
+  ;; calls a merged name must too.
+  #:duplicates (merge-generics replace warn-override-core warn last)
+
   #:export (tray-widget
             tray-items
             update-tray!
@@ -405,7 +425,17 @@ substance of it:
          (inner (make <gtk-box> #:orientation 'horizontal))
          (button (make <gtk-button> #:has-frame #f)))
     (gtk-widget-add-css-class button "model-item")
-    (when known (set-sensitive button (and enabled #t)))
+    ;; SEQUENCED, not used as a value.  `set-sensitive' is a void GTK method, so
+    ;; G-Golf has it return ZERO values -- and `when', which wants one, raises
+    ;; "Zero values returned to single-valued continuation" for the whole call.
+    ;; Inside refresh-menu!'s catch that surfaced as "cannot build menu" and a
+    ;; menu that never appeared at all.
+    ;;
+    ;; The same shape as gtk-window-set-interactive-debugging in known-issues:
+    ;; a void C setter reached through Scheme where a value is expected.
+    (when known
+      (set-sensitive button (and enabled #t))
+      #t)
     ;; The tick, before the label, as ags2-shell places it.
     (when checked
       (let ((check (make <gtk-image> #:icon-name "object-select-symbolic"
@@ -499,8 +529,18 @@ handler, which is what this does."
          (popover (make <gtk-popover>))
          (button (make <gtk-button> #:has-frame #f)))
     (gtk-widget-add-css-class button class)
+    ;; SEQUENCED, and this is the third instance of the same trap in this file.
+    ;; `set-tooltip-text' is a void GTK method, so it returns ZERO values and
+    ;; `when' -- which wants one -- raises "Zero values returned to
+    ;; single-valued continuation" for the whole build.  The menu then never
+    ;; appears, with an error that names no widget, no property and no line.
+    ;;
+    ;; The other two are set-sensitive and set-child below.  (Note
+    ;; gtk-widget-add-css-class and append are void as well, but they sit in
+    ;; statement position where the value is discarded and nothing complains.)
     (when (item-tooltip item)
-      (set-tooltip-text button (item-tooltip item)))
+      (set-tooltip-text button (item-tooltip item))
+      #t)
     (set-child button (make <gtk-image> #:gicon (item-icon item)
                                         #:pixel-size icon-size))
     ;; The action group must be on an ANCESTOR of the buttons that reference
@@ -555,7 +595,10 @@ headless at all."
       (menu-about-to-show! item)
       (let ((box (build-menu-box (item-menu-model item) group
                                  (lambda () (popdown popover)))))
-        (when box (set-child popover box))
+        ;; Sequenced, for the same reason as set-sensitive above: set-child is a
+        ;; void GTK method and `when' wants one value.
+        (when box
+          (set-child popover box))
         box))
     (lambda (key . args)
       (format (current-error-port)
@@ -685,18 +728,29 @@ registers."
   "Every label's text under WIDGET, in tree order.
 
 RECURSIVE, because a menu row is button > box > label and a walk of direct
-children only finds nothing -- which is exactly how this helper first reported
-an empty menu that was in fact built."
-  (let loop ((child (gtk-widget-get-first-child widget)) (out '()))
-    (if (not child)
-        (reverse out)
-        (loop (gtk-widget-get-next-sibling child)
-              (cond ((is-a? child <gtk-label>)
-                     (cons (catch #t (lambda () (slot-ref child 'label))
-                                  (lambda args ""))
-                           out))
-                    (else
-                     (append (reverse (widget-labels child)) out)))))))
+children finds nothing -- which is exactly how this helper first reported an
+empty menu that was in fact built.
+
+Folded with cons rather than `append': in this module `append' is GTK's
+generic, so using it on two LISTS dispatches into GTK's dispatch and is only
+saved by the core list method surviving the merge.  cons and reverse have no
+such ambiguity."
+  (if (not (is-a? widget <gtk-widget>))
+      '()
+      (let loop ((child (gtk-widget-get-first-child widget)) (out '()))
+        (if (not child)
+            (reverse out)
+            (loop (gtk-widget-get-next-sibling child)
+                  (cond ((is-a? child <gtk-label>)
+                         (cons (catch #t (lambda () (slot-ref child 'label))
+                                      (lambda args ""))
+                               out))
+                        (else
+                         (let build ((rest (reverse (widget-labels child)))
+                                     (acc out))
+                           (if (null? rest)
+                               acc
+                               (build (cdr rest) (cons (car rest) acc)))))))))))
 
 (define (tray-item-menu-labels item)
   "The labels ITEM's application menu would show, in order, or '().
