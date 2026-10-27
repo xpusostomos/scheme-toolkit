@@ -54,7 +54,8 @@
             update-tray!
             tray-item-menu-labels
             item-menu-model
-            refresh-menu!))
+            refresh-menu!
+            tray-item-action-report))
 
 (define-gi-imports "Gtk" "Box" "Button" "Image" "MenuButton" "PopoverMenu" "Widget")
 (define-gi-imports "Gio" "MenuModel" "ActionGroup" "SimpleActionGroup")
@@ -312,8 +313,26 @@ forever, and a tray menu four levels deep is not a thing anyone has."
                   (loop (+ i 1))))
               box)))))
 
+(define (action-name full-action)
+  "FULL-ACTION with its prefix stripped: \"dbusmenu.id-10\" -> \"id-10\".
+
+THE REASON CLICKING DID NOTHING.  A DBusMenu item's action attribute is
+PREFIXED -- the model says \"dbusmenu.id-10\" -- while the action group exports
+the bare name, \"id-10\".  Activating the prefixed name asks the group for an
+action it does not have, and GActionGroup::activate_action does not raise when
+the name is unknown: it does nothing at all.  So every row appeared, was
+sensitive, was clickable, and silently did nothing.
+
+ags2-shell strips it the same way (`action_name' in TrayMenu.tsx)."
+  (let ((dot (and (string? full-action) (string-index full-action #\.))))
+    (if dot (substring full-action (+ dot 1)) full-action)))
+
 (define (menu-action-button label action group close!)
-  "A button for a labelled menu item, wired to GROUP's ACTION."
+  "A button for a labelled menu item, wired to GROUP's ACTION.
+
+An action the group does not have is reported rather than ignored: the row is
+already on screen and clickable by then, so a silent no-op is the one outcome a
+user cannot diagnose."
   (let* ((inner (make <gtk-box> #:orientation 'horizontal))
          (button (make <gtk-button> #:has-frame #f)))
     (gtk-widget-add-css-class button "model-item")
@@ -323,13 +342,23 @@ forever, and a tray menu four levels deep is not a thing anyone has."
     (set-child button inner)
     (connect button 'clicked
              (lambda (b)
-               (when (and group action (not (string-null? action)))
-                 (catch #t
-                   (lambda () (activate-action group action #f))
-                   (lambda (key . args)
-                     (format (current-error-port)
-                             "scheme-toolkit: tray: action ~a failed: ~a~%"
-                             action key))))
+               (let ((name (action-name action)))
+                 (cond
+                  ((or (not group) (not name) (string-null? name))
+                   ;; A label with no action is a legitimate menu row (a header,
+                   ;; or an item an application chose not to wire up).
+                   #f)
+                  ((not (has-action group name))
+                   (format (current-error-port)
+                           "scheme-toolkit: tray: no action ~s on the item's group~%"
+                           name))
+                  (else
+                   (catch #t
+                     (lambda () (activate-action group name #f))
+                     (lambda (key . args)
+                       (format (current-error-port)
+                               "scheme-toolkit: tray: action ~a failed: ~a ~s~%"
+                               name key args))))))
                (when close! (close!))))
     button))
 
@@ -609,4 +638,39 @@ reported 8 items while the popover showed nothing."
     (lambda (key . args)
       (format (current-error-port)
               "scheme-toolkit: tray: cannot read menu: ~a ~s~%" key args)
+      '())))
+
+(define (tray-item-action-report item)
+  "For ITEM's menu: one (LABEL ACTION RESOLVES?) per row.
+
+RESOLVES? is whether the action group actually has the action the row names --
+the check that was missing when every row was clickable and did nothing.  A
+Gtk menu row is sensitive and clickable whether or not its action exists, and
+GActionGroup::activate_action does not raise for an unknown name, so the only
+symptom is that nothing happens.
+
+Useful from a REPL on a tray item that does not respond."
+  (catch #t
+    (lambda ()
+      (let* ((model (menu-unwrap (item-menu-model item)))
+             (group (item-attr item 'action-group))
+             (n (if model (get-n-items model) 0)))
+        (let loop ((i 0) (out '()))
+          (if (>= i n)
+              (reverse out)
+              (let ((label (menu-attribute model i "label"))
+                    (action (menu-attribute model i "action")))
+                (loop (+ i 1)
+                      (if label
+                          (cons (list label
+                                      action
+                                      (if (and group action
+                                               (has-action group (action-name action)))
+                                          #t
+                                          #f))
+                                out)
+                          out)))))))
+    (lambda (key . args)
+      (format (current-error-port)
+              "scheme-toolkit: tray: cannot report actions: ~a ~s~%" key args)
       '())))
