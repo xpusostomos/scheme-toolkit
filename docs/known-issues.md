@@ -122,6 +122,35 @@ importing it — it worked only because another module's import reached the same
 module graph. `define-gi-imports` per module is the rule; the same grep catches
 it.
 
+## Rebuilding a layer window: three things that silently produce nothing
+
+A live config change that alters the shape of the tree needs the windows
+rebuilt rather than patched in place. Each of the three steps below failed in
+a way that logged nothing and left the registry looking healthy.
+
+**1. `for-each-monitor` skips monitors that already have a root.** Correct for
+a hotplug, wrong for a rebuild: the roots still exist, so every monitor counted
+as already done and *nothing was built*. Hence `#:force?`, which disposes the
+old root first.
+
+**2. A rebuilt window is not presented.** `run-shell` presents on the
+application's `activate`, which fires once. So the rebuild produced windows
+that were registered, `visible` in the registry, and had **no surface at all**.
+Presenting after a rebuild is the caller's job.
+
+**3. Do not dispose the root while rebuilding.** Roots are per-*monitor*, not
+per-window-name, and the new widgets register inside the same root. Disposing
+it tears down the scope the replacement is about to use, so the fresh widgets
+subscribe into a dead scope. `destroy-windows!` destroys the widgets and
+leaves the root alone.
+
+**One unrelated trap met while testing the above.** A `GtkApplication` holds
+its `application-id` for its lifetime, so while an old shell process is alive a
+new one prints "already running; use `scheme-toolkit eval'" and exits 0 —
+which reads exactly like a crash on startup if you are watching the surface
+count rather than the message. `scheme-toolkit list` distinguishes the two: no
+listener plus surfaces on screen means a stale process, not a successful start.
+
 ## Three element-runtime bugs that only existed behind an earlier crash
 
 `tests/element.scm` reported 19 passes and no failures for a long time. It was
