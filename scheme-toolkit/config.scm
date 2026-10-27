@@ -31,7 +31,19 @@
   #:use-module (scheme-toolkit gi)
   #:use-module (scheme-toolkit reactive)
   #:use-module (scheme-toolkit result)
-  #:use-module (scheme-toolkit file)
+  ;; QUALIFIED, and this is not cosmetic.
+  ;;
+  ;; Importing Gtk also brings Gio's `GFile.monitor_file' under the name
+  ;; `monitor-file', and the generic then carries ONLY Gio's methods -- so a
+  ;; plain (use-modules (scheme-toolkit file)) here would resolve monitor-file
+  ;; to Gio's and every call would fail with "No applicable method for
+  ;; #<<generic> monitor-file (2)>", naming an arity rather than the collision.
+  ;;
+  ;; This module happened to work because it lists (scheme-toolkit gi) FIRST,
+  ;; so file's binding won the merge -- luck, not design: reversing the two
+  ;; lines silently breaks live config reload.  A prefix makes the choice
+  ;; explicit and order-independent.
+  #:use-module ((scheme-toolkit file) #:prefix file:)
   #:use-module (scheme-toolkit time)
   #:use-module (oop goops)
   #:use-module (srfi srfi-9)
@@ -99,7 +111,7 @@ new one, never a half-written line."
                                                      (car opt))))
                                (lambda args #f))))
                      (config-options config))))
-    (write-file tmp
+    (file:write-file tmp
                 (with-output-to-string
                   (lambda ()
                     (display ";; scheme-toolkit config.  S-expressions: comments\n")
@@ -112,7 +124,13 @@ new one, never a half-written line."
       (lambda (key . rest)
         (log-error (cons key rest) (format #f "renaming ~a into place" tmp))
         ;; Fall back to a plain write rather than losing the change entirely.
-        (write-file path (read-file tmp ""))))))
+        ;;
+        ;; read-file takes its fallback as a KEYWORD.  A positional second
+        ;; argument raises keyword-argument-error, and inside this catch that
+        ;; meant the recovery itself failed silently -- a config that could not
+        ;; be renamed into place lost the change, which is the one outcome this
+        ;; whole branch exists to prevent.
+        (file:write-file path (file:read-file tmp #:fallback ""))))))
 
 ;; Applying one line of the file.  Pulled out of load-config-file! because the
 ;; nesting there was deep enough to lose count of, which is how a stray paren
@@ -144,7 +162,7 @@ new one, never a half-written line."
 
 Per-option rather than all-or-nothing: one bad value should not discard the rest
 of a user's config.  Each rejection is logged with the option's name."
-  (let ((text (read-file (config-file config) #:fallback #f)))
+  (let ((text (file:read-file (config-file config) #:fallback #f)))
     (if (not text)
         #f                          ; no file yet; the defaults stand
         (let ((parsed (attempt (lambda () (with-input-from-string text read)))))
@@ -242,7 +260,7 @@ saving writes atomically: the watcher sees the temporary file too, and a
 half-written one would be read as corrupt -- and moved aside!"
   (unless (hashq-ref %watches name)
     (hashq-set! %watches name
-                (monitor-file
+                (file:monitor-file
                  (config-file config)
                  (lambda (kind path)
                    ;; The rename is what we care about; the temporary file's own
@@ -334,7 +352,7 @@ and NAME is then what config-ref and config-set! are addressed by:
 the first load."
   (let* ((config (make-config-record options #f (make-hash-table)
                                      (make-hash-table) (make-hash-table) #f))
-         (path (expand-path
+         (path (file:expand-path
                 (if (or (string-prefix? "/" file) (string-prefix? "~" file))
                     file
                     (string-append (xdg-config-home) "/"
