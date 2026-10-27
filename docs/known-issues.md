@@ -351,3 +351,26 @@ The one real problem in that area is a NAME COLLISION, not dispatch: Gio binds
 `monitor-file` on GFile and `(scheme-toolkit file)` exports `monitor-file`, so
 importing both makes the wrapper call itself. Gio's is imported into a private
 module and fetched from there.
+
+## OPEN: "New application windows must be added after GApplication::startup"
+
+Two `Gtk-CRITICAL` warnings appear at shell startup. Windows still appear and
+behave, so this is cosmetic — but it is real, and it is not the ordering it
+names.
+
+**Ruled out by experiment.** Building a `Gtk.Window` inside the `activate`
+handler does NOT produce it, and neither does building an `Astal.Window` there:
+both minimal cases are clean. So `run-shell`'s activate-time build is not the
+cause, and moving construction to `startup` would be cargo-culting.
+
+**What is left to check.** The shell builds a nested element tree (centerbox →
+three boxes → module widgets) inside the window, and `element` applies CSS and
+attaches controllers along the way. The likeliest explanation is one of those
+children reaching for something that wants an application window already
+registered — a style provider or a controller added before the toplevel is
+attached.
+
+**Why it is not fixed here.** It costs nothing at runtime, and guessing at a
+fix would put an untested reordering into the startup path of every shell built
+on this toolkit. Worth root-causing when M8 adds notification popups, which
+create windows on the fly and would multiply the warning.
