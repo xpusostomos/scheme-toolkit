@@ -24,9 +24,29 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 TOOLKIT_ROOT="$(dirname "$(dirname "$SELF")")"
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-}"
 
-# Astal installs to /usr/local and is not in the ldconfig cache.
-export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export GI_TYPELIB_PATH="/usr/local/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+# Astal: PREFER THE SYSTEM INSTALL.
+#
+# This used to hard-code /usr/local/lib, from when Astal was a hand-build that
+# the ldconfig cache did not know about -- the cache had ZERO astal entries, so
+# without LD_LIBRARY_PATH GI silently imported the typelibs in enums-only mode.
+# That is no longer true on this machine: Astal is installed as pacman packages
+# (libastal-*-git) under /usr/lib, the cache has 40+ astal entries, and
+# /usr/lib/girepository-1.0 is a standard GI search path.  So on a machine like
+# this one, NEITHER variable is needed -- and setting them actively caused a
+# problem, by making every process load a stale hand-build in preference to the
+# packaged one.
+#
+# The variables are therefore set only when the system install is NOT present,
+# which keeps this working on a machine where Astal really is a hand-build.
+#
+#   /usr/local/lib/libastal-4.so   310 KB, Oct 25  (a source build)
+#   /usr/lib/libastal-4.so.4.0.0    71 KB, Oct 27  (the package)
+#
+# Both were present here, and LD_LIBRARY_PATH decided which one a shell used.
+if [ ! -e /usr/lib/libastal-4.so.4 ] && [ -e /usr/local/lib/libastal-4.so ]; then
+    export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export GI_TYPELIB_PATH="/usr/local/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+fi
 
 # libgtk4-layer-shell must be preloaded for Astal.Window to work at all.  Keep
 # any existing preload entries and prepend ours.

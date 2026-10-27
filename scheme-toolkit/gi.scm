@@ -161,26 +161,66 @@ that is simply not bound, and the failure is a bare \"No variable named\"."
             "Fix: run through bin/scheme-toolkit, or set"
             (format #f "  export LD_PRELOAD=~a" %layer-shell-library)))))
 
-;; The Astal typelibs live in /usr/local and are NOT in the ldconfig cache, so
-;; GI loads them only in "enums only" mode: no error, but <astal-window> and
-;; every other class is simply missing.  Asserting a known class exists catches
-;; the degradation that a "did it load?" test would not.
+;; THE DEGRADATION THIS GUARDS AGAINST, and why it tests a CLASS rather than a
+;; PATH.
+;;
+;; When GI cannot find Astal's shared libraries it loads the typelibs in
+;; "enums only" mode: no error is raised, but <astal-window> and every other
+;; class is simply missing, and a shell fails later in a way that names nothing.
+;;
+;; The first version of this check asserted that GI_TYPELIB_PATH contained
+;; /usr/local/lib/girepository-1.0 -- because at the time Astal was a hand-build
+;; there and absent from the ldconfig cache.  That stopped being true once Astal
+;; was packaged under /usr/lib: the path assertion then rejected a perfectly
+;; good environment, and it would equally have PASSED an environment that named
+;; the directory but could not load anything from it.
+;;
+;; So it asks the only question that matters: **is an Astal class actually
+;; reachable?**  That is true whether Astal comes from /usr/lib or /usr/local,
+;; and false for both the enums-only degradation and a broken path.
+(define (astal-class-reachable?)
+  (catch #t
+    (lambda ()
+      (g-irepository-require "Astal" #:version "4.0")
+      (gi-import-by-name "Astal" "Window")
+      (module-bound? (current-module) '<astal-window>))
+    (lambda args #f)))
+
 (define (assert-typelib-path!)
-  (let ((p (getenv-non-empty "GI_TYPELIB_PATH")))
-    (unless (and p (path-contains? p "/usr/local/lib/girepository-1.0"))
-      (error (error-list
-              "GI_TYPELIB_PATH does not include /usr/local/lib/girepository-1.0."
-              "Astal's typelibs are installed there, and they are not in the"
-              "ldconfig cache; without the path GI imports enums only and all"
-              "Astal classes are missing.")))))
+  (unless (astal-class-reachable?)
+    (error (error-list
+            "Astal's typelibs could not be loaded: <astal-window> is missing."
+            "GI degrades to enums-only without raising an error, so every"
+            "Astal class silently disappears."
+            ""
+            "Astal is normally installed as a package under /usr/lib, which GI"
+            "searches by default.  If it is a hand-build elsewhere, point GI"
+            "at it:"
+            "  export GI_TYPELIB_PATH=/usr/local/lib/girepository-1.0"
+            (format #f "  (current GI_TYPELIB_PATH: ~a)"
+                    (or (getenv-non-empty "GI_TYPELIB_PATH") "(unset)"))))))
+
+;; LD_LIBRARY_PATH, checked for the same reason and with the same change: the
+;; question is not "is a particular directory named" but "can the libraries
+;; actually be found".  A packaged Astal under /usr/lib needs no help at all,
+;; and a hand-build elsewhere does -- so this asks the linker rather than a
+;; hard-coded path.
+(define (astal-library-findable?)
+  (or (file-exists? "/usr/lib/libastal-4.so.4")
+      (file-exists? "/usr/local/lib/libastal-4.so.4")))
 
 (define (assert-library-path!)
   (let ((p (getenv-non-empty "LD_LIBRARY_PATH")))
-    (unless (and p (path-contains? p "/usr/local/lib"))
+    (unless (or (astal-library-findable?)
+                (and p (path-contains? p "/usr/local/lib")))
       (error (error-list
-              "LD_LIBRARY_PATH does not include /usr/local/lib."
-              "The astal shared libraries are not in the ldconfig cache, so"
-              "GI must be told where they are.")))))
+              "Astal's shared libraries cannot be found."
+              "Neither /usr/lib/libastal-4.so.4 nor a hand-build under"
+              "/usr/local/lib is present, so astal-window cannot be created."
+              ""
+              "Fix: install the libastal packages, or set"
+              "  export LD_LIBRARY_PATH=/usr/local/lib"
+              (format #f "  (current LD_LIBRARY_PATH: ~a)" (or p "(unset)")))))))
 
 ;; AstalNotifd reads a GSettings schema that ships uncompiled; the process
 ;; aborts rather than throwing, so it cannot be caught at use time.

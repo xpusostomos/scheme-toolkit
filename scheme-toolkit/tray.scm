@@ -75,7 +75,14 @@
             tray-item-menu-labels
             item-menu-model
             refresh-menu!
-            tray-item-action-report))
+            tray-item-action-report
+            ;; The model accessors, exported for DIAGNOSIS: working out what a
+            ;; tray menu actually contains means walking the model by hand, and
+            ;; that is impossible from outside without these.
+            menu-item-attribute
+            menu-item-section
+            menu-item-submenu
+            item-attr))
 
 (define-gi-imports "Gtk" "Box" "Button" "Image" "MenuButton" "PopoverMenu" "Widget"
                    "Separator" "Label" "Popover")
@@ -389,60 +396,78 @@ compared against the target.  ags2-shell's is_checked, in Scheme."
 ;;; Building the menu
 ;;; ---------------------------------------------------------------------------
 
-(define %menu-budget 200)
+;;; NO COUNTERS, NO LOOPS.  The model is turned into a LIST and the list is
+;;; mapped; nothing is mutated and nothing is threaded through an accumulator.
+;;;
+;;; The first version of this was a port of ags2-shell's TypeScript
+;;; `append_model`, which is an index loop over `get_n_items` carrying a
+;;; mutable `budget` object and appending into a widget.  Translating that
+;;; literally gave Scheme that reads like TypeScript, and it had a second cost:
+;;; reasoning about the menu meant counting items, which is how a question about
+;;; STRUCTURE ("is Close in the model?") got answered with a number ("8") for
+;;; several rounds.
+;;;
+;;; `list-model-ref` is index addressing because GListModel IS index addressed;
+;;; there is no other way to enumerate one.  Everything above that is list
+;;; operations.
 
-(define* (append-model! box model group close! ancestors budget depth)
-  "Append MODEL's rows to BOX.
+(define (list-model-length model)
+  "How many rows MODEL holds, or 0 if it cannot say.
 
-A FAITHFUL PORT of ags2-shell's append_model, and the details are the whole
-substance of it:
+The only place a count is taken, and it is immediately turned into an index
+list -- after this, nothing counts."
+  (catch #t (lambda () (get-n-items model)) (lambda args 0)))
 
-  A linked SECTION is not a row -- it is a separATOR and then its contents.
-  That is where a tray menu's dividing rules come from, and skipping it (as an
-  earlier version did) loses the line before Edit/Quit.
+(define (list-model-indices model)
+  "MODEL as a list of indices, in order."
+  (iota (list-model-length model)))
 
-  A linked SUBMENU becomes a button that POPS OUT into its own popover on the
-  right.  Rendering it inline is wrong: the application chose a submenu, and
-  inline expansion also makes the parent menu jump about.
+(define %max-menu-depth 16)
 
-  BUDGET is shared across the whole recursion, so a runaway model cannot build
-  unbounded widgets; ANCESTORS catches a model that links to itself."
-  (if (or (> depth 16) (memq model ancestors) (<= budget 0))
-      box
-      ;; UNWRAP HERE, not only at the top.  A submenu passed in from a parent
-      ;; row is wrapped exactly as the root model is -- one item whose link is a
-      ;; section -- so without this the submenu renders as a single unlabelled
-      ;; row.  That was the empty Connection submenu: the parent menu was right
-      ;; and its contents were one level of wrapper away.
+(define* (model->widgets model group close! #:optional (depth 0) (ancestors '()))
+  "The widgets MODEL contributes, as a LIST.
+
+PURE: it builds a list rather than appending into a box, so the caller decides
+how to attach it and a test can read the whole menu without a widget tree.
+
+Two things bound the recursion, and both are properties of the model rather
+than a counter to thread: DEPTH (a menu has few levels) and ANCESTORS (a model
+that links to itself)."
+  (if (or (> depth %max-menu-depth) (memq model ancestors))
+      '()
       (let* ((model (menu-unwrap model))
-             (ancestors (cons model ancestors))
-             (n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
-        (let loop ((i 0) (budget budget))
-          (if (or (>= i n) (<= budget 0))
-              box
-              (let ((section (catch #t (lambda () (get-item-link model i "section"))
-                                    (lambda args #f))))
-                (cond
-                 (section
-                  ;; A separator, but only between sections -- a leading rule at
-                  ;; the top of the menu is not what the application drew.
-                  (when (gtk-widget-get-last-child box)
-                    (append box (make <gtk-separator> #:orientation 'horizontal)))
-                  (append-model! box section group close! ancestors
-                                 (- budget 1) (+ depth 1))
-                  (loop (+ i 1) (- budget 1)))
-                 (else
-                  (let ((label (menu-attribute model i "label"))
-                        (sub (menu-item-submenu model i)))
-                    (cond
-                     (sub
-                      (when label
-                        (append box (menu-submenu-button
-                                     label sub group close! ancestors
-                                     (- budget 1) depth))))
-                     (label
-                      (append box (menu-action-button model i label group close!))))
-                    (loop (+ i 1) (- budget 1)))))))))))
+             (ancestors (cons model ancestors)))
+        (append-map (lambda (i) (row->widgets model i group close! ancestors depth))
+                    (list-model-indices model)))))
+
+(define (row->widgets model index group close! ancestors depth)
+  "The widgets for MODEL's INDEX-th row: a list of zero, one or many.
+
+A SECTION is a group of rows, introduced by a dividing rule -- the rule is
+skipped when the section is the menu's first row, because a line at the very
+top is not what the application drew.
+
+A SUBMENU is a row that pops out.  A labelled row is an action button.  A row
+with none of the three is a separator the application asked for, and is drawn
+as one."
+  (let ((section (menu-item-section model index))
+        (submenu (menu-item-submenu model index))
+        (label (menu-attribute model index "label")))
+    (cond
+     (section
+      (append (if (zero? index)
+                  '()
+                  (list (make <gtk-separator> #:orientation 'horizontal)))
+              (model->widgets section group close! (+ depth 1) ancestors)))
+     (submenu
+      (if label
+          (list (menu-submenu-button label submenu group close! ancestors
+                                     depth))
+          '()))
+     (label
+      (list (menu-action-button model index label group close!)))
+     (else
+      (list (make <gtk-separator> #:orientation 'horizontal))))))
 
 (define (menu-action-button model index label group close!)
   "A button for a labelled menu item: ticked if checked, dimmed if disabled.
@@ -510,7 +535,7 @@ substance of it:
                (when close! (close!))))
     button))
 
-(define (menu-submenu-button label submodel group close! ancestors budget depth)
+(define (menu-submenu-button label submodel group close! ancestors depth)
   "A button for a submenu, popping SUBMODEL out to the right.
 
 POPS OUT, does not expand inline.  The application chose a submenu; inline
@@ -532,9 +557,12 @@ express a submenu that is itself a section of sections."
     (catch #t (lambda () (set-parent popover button)) (lambda args #f))
     (let ((box (make <gtk-box> #:orientation 'vertical)))
       (gtk-widget-add-css-class box "tray-menu")
-      (append-model! box submodel group
-                     (lambda () (popdown popover) (when close! (close!)))
-                     ancestors budget (+ depth 1))
+      ;; `for-each append' is the ONE imperative step, at the edge: everything
+      ;; above it produced a list.
+      (for-each (lambda (w) (append box w))
+                (model->widgets submodel group
+                                (lambda () (popdown popover) (when close! (close!)))
+                                (+ depth 1) ancestors))
       (set-child popover box))
     (connect-signal! button "clicked"
              (lambda (b)
@@ -551,7 +579,8 @@ express a submenu that is itself a section of sections."
         ;; targets: `window#bar popover contents .tray-menu { min-width: ... }'
         ;; plus the padding rules for `button.model-item' and `separator'.
         (gtk-widget-add-css-class box "tray-menu")
-        (append-model! box model group close! '() %menu-budget depth)
+        (for-each (lambda (w) (append box w))
+                  (model->widgets model group close! depth))
         box)))
 
 (define* (tray-menu-button item #:optional (class "tray-item") (icon-size 16))
