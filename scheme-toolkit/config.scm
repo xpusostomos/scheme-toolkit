@@ -355,7 +355,7 @@ the first load."
          (path (file:expand-path
                 (if (or (string-prefix? "/" file) (string-prefix? "~" file))
                     file
-                    (string-append (xdg-config-home) "/"
+                    (string-append (file:xdg-config-home) "/"
                                    (symbol->string name) "/" file)))))
     (register-config! name config)
     (set-config-file! config path)

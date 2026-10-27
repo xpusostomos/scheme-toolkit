@@ -77,7 +77,8 @@
             refresh-menu!
             tray-item-action-report))
 
-(define-gi-imports "Gtk" "Box" "Button" "Image" "MenuButton" "PopoverMenu" "Widget")
+(define-gi-imports "Gtk" "Box" "Button" "Image" "MenuButton" "PopoverMenu" "Widget"
+                   "Separator" "Label" "Popover")
 (define-gi-imports "Gio" "MenuModel" "ActionGroup" "SimpleActionGroup")
 
 (gi-import-by-name "AstalTray" "Tray")
