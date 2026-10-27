@@ -28,7 +28,7 @@
             app-instance
             layer-window window-set-anchored!
             windows window windows-named window-names window-visible?
-            toggle-window
+            toggle-window destroy-windows!
             monitors for-each-monitor monitor-name monitor-geometry
             on-monitors-changed
             inspect
@@ -181,6 +181,29 @@ wants -- `(toggle-window \"bar\")' should not leave one monitor's bar behind."
                     ws)
           target))))
 
+(define (destroy-windows! name)
+  "Destroy every window named NAME and remove it from the registry.
+
+A REBUILD uses this: an option that decides the shape of the tree changed, so
+the windows are built again rather than patched in place.
+
+It does NOT dispose the reactive root.  Roots are per-MONITOR, not per-window
+name, and a rebuild builds the new windows inside the SAME root -- disposing it
+would tear down the scope the new bar is about to register its bindings in, and
+the fresh widgets would be subscribed into a dead scope.  Root disposal belongs
+to for-each-monitor, which is where roots are created."
+  (let ((doomed (windows-named name)))
+    (set! %windows (filter (lambda (pair) (not (equal? (car pair) name))) %windows))
+    (for-each
+     (lambda (pair)
+       (catch #t
+         (lambda () (destroy (cdr pair)))
+         ;; A window the compositor already took is not an error worth
+         ;; stopping a rebuild for.
+         (lambda (key . rest) #f)))
+     doomed)
+    (length doomed)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Monitors
 ;;; ---------------------------------------------------------------------------
@@ -238,9 +261,14 @@ ones that arrived."
     (lambda ()
       (catch #t (lambda () (disconnect model id)) (lambda args #f)))))
 
-(define (for-each-monitor proc)
+(define* (for-each-monitor proc #:key (force? #f))
   "Call PROC with each connected monitor, keyed so that a monitor coming back
 keeps its identity.
+
+FORCE? rebuilds even for a monitor that already has a root, disposing the old
+one first.  A rebuild needs it: it destroys the windows and calls this again,
+and without the override every monitor counts as already done and nothing is
+built.
 
 PROC is called as (proc monitor name).  Whatever PROC creates belongs to a root
 registered under NAME, so calling this again after a hotplug rebuilds only what
@@ -252,7 +280,17 @@ monitors that have gone are disposed."
                   (hash-set! seen name #t)
                   ;; Rebuild only when it really is new: rebuilding a bar whose
                   ;; monitor has not moved is wasted work and a visible flicker.
-                  (unless (hash-ref %monitor-roots name)
+                  ;;
+                  ;; FORCE? overrides that.  A rebuild destroys the windows and
+                  ;; then calls this again, and without the override nothing is
+                  ;; built: the roots still exist, so every monitor is treated as
+                  ;; already done and the shell is left with no bar at all --
+                  ;; silently, because "monitor already has a root" is an
+                  ;; ordinary state, not an error.
+                  (when (or force? (not (hash-ref %monitor-roots name)))
+                    (when force?
+                      (let ((old (hash-ref %monitor-roots name)))
+                        (when old (catch #t (lambda () (old)) (lambda args #f)))))
                     (let ((dispose
                            (create-root
                             (lambda (_dispose)
