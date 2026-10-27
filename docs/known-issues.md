@@ -374,3 +374,73 @@ attached.
 fix would put an untested reordering into the startup path of every shell built
 on this toolkit. Worth root-causing when M8 adds notification popups, which
 create windows on the fly and would multiply the warning.
+
+## "overrides core binding" warnings: measured, and they are benign
+
+Startup prints a wall of these:
+
+    WARNING: (scheme-toolkit astal): imported module (scheme-toolkit gi)
+             overrides core binding `connect'
+    WARNING: (scheme-toolkit reactive): imported module (scheme-toolkit gi)
+             overrides core binding `map'
+
+They are worth taking seriously -- a core binding really is being replaced --
+so the behaviour was tested rather than reasoned about.  The short answer: the
+procedures keep working on ordinary data, because the handler is
+`merge-generics`, which MERGES rather than replaces.
+
+**What actually happens.**  `gi.scm` installs
+
+    (default-duplicate-binding-handler
+      '(merge-generics replace warn-override-core warn last))
+
+With `merge-generics`, when an import provides a binding whose name is already
+bound to a generic, the two are merged into ONE generic carrying both sets of
+methods.  So after importing Gtk:
+
+    map      => <generic>, one method, specializer (<gtk-widget>)
+    connect  => <generic>, two methods, (<g-cancellable> ...) and
+                (<gtype-instance> <top>)
+
+Both are still callable on plain Scheme data, verified:
+
+    (map 1+ '(1 2 3))              => (2 3 4)
+    (map + '(1 2) '(10 20))        => (11 22)     ; still variadic
+    (for-each ... '(1 2 3))        => works
+    (member 2 '(1 2 3))            => (2 3)
+    (append '(1) '(2))             => (1 2)
+    (assoc "b" ...)                => ("b" . 2)
+
+Nothing in the tree lost behaviour.  If `merge-generics` were absent and the
+handler were `replace`, `map` would become a one-method generic that only
+accepts a `<gtk-widget>` -- and every `(map f list)` in the codebase would fail.
+The handler is load-bearing in exactly this way, which is why `gi.scm` sets it
+*before* `(use-modules (g-golf))` and explains why in a comment.
+
+**One thing that did NOT regress, contrary to a claim made while investigating.**
+GOOPS slot observers are `(add-observer! slot object proc)`, and they are not
+available in this Guile's `(oop goops)` at all (`add-observer!` is unbound with
+or without G-Golf).  The plain `connect` is Guile's SOCKET connect -- it takes a
+file descriptor, and G-Golf does not change that:
+
+    (connect s AF_UNIX path)            => works, on a real listening socket
+    (connect some-slot proc)            => wrong-type-arg (expecting open file
+                                           port), both with and without G-Golf
+
+So `connect` was never the GOOPS observer procedure here, and the GI generic
+adds GObject signal connections alongside the socket one rather than displacing
+it.  Checked because the first reading of the warnings suggested a regression
+that does not exist.
+
+**What the warnings ARE good for.** They are a reliable index of which names
+G-Golf takes, which is the trap recorded earlier in this file: a module that
+exports a bare common name can have it silently replaced by a GI generic.  The
+list currently includes `map`, `for-each`, `member`, `max`, `append`, `connect`,
+`assoc`, `read`, `peek`, `start`, `stop`, `show`, `hide`, `quit`, `present`.
+The toolkit's answer is to prefix its own colliding exports
+(`st-peek`, `run-shell`, `quit-shell`, `<st-accessor>`).
+
+If the noise is unwanted it can be silenced with
+`(default-duplicate-binding-handler '(merge-generics replace last))` -- dropping
+`warn-override-core` -- but that removes the index, and the warning has already
+earned its place twice.
