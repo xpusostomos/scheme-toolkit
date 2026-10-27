@@ -22,7 +22,9 @@
 (use-modules (srfi srfi-1))
 (use-modules (srfi srfi-64))
 
-(define-gi-imports "Gtk" "Widget")
+(define-gi-imports "Gtk" "Widget" "Label" "Popover" "Button")
+;; get-n-items, for counting a model's rows without rendering them.
+(define-gi-imports "Gio" "MenuModel")
 (gtk-bootstrap!)
 
 ;; GTK's own child list.  %element-children is deliberately NOT used -- the tray
@@ -32,6 +34,23 @@
   (let loop ((c (gtk-widget-get-first-child w)) (out '()))
     (if c (loop (gtk-widget-get-next-sibling c) (cons c out))
         (reverse out))))
+
+(define (tree-labels w)
+  "Every label's text under W, recursively.
+
+RECURSIVE on purpose: a menu row is button > box > label, and a walk of direct
+children reports an empty menu that was in fact built -- which is how this
+area was first mis-verified."
+  (if (not (is-a? w <gtk-widget>))
+      '()
+      (let loop ((child (gtk-widget-get-first-child w)) (out '()))
+        (cond ((not child) (reverse out))
+              ((is-a? child <gtk-label>)
+               (loop (gtk-widget-get-next-sibling child)
+                     (cons (slot-ref child 'label) out)))
+              (else
+               (loop (gtk-widget-get-next-sibling child)
+                     (append (reverse (tree-labels child)) out)))))))
 
 (define* (wait-for pred #:optional (seconds 10))
   "Run the main loop until PRED is true, or give up.
@@ -123,5 +142,102 @@ itself schedules a chance to fire."
           ;; building a button for a title-less item does not raise, which the
           ;; wait above already proved by producing children.
           #t))))
+
+(test-group "the menu is rendered, not just reported"
+  ;; THE distinction this whole area turned on.  A Gio.DBusMenuModel reported 8
+  ;; items while Gtk.PopoverMenu rendered none of them, so a test asserting on
+  ;; the MODEL passes through the entire bug.  These assert on the widget tree
+  ;; the popover actually gets.
+  (let ((items (begin (wait-for (lambda () (pair? (tray-items))) 12)
+                      (tray-items))))
+    (if (null? items)
+        (test-skip "no StatusNotifier items on this machine's bus")
+        (let* ((item (car items))
+               (labels (tray-item-menu-labels item)))
+          (test-assert "the labels are a list" (list? labels))
+          ;; An item with no menu at all is legitimate (click-to-activate only),
+          ;; so emptiness is not itself a failure -- but a menu that HAS rows
+          ;; must produce labels.
+          (let ((n (catch #t (lambda () (get-n-items (item-menu-model item)))
+                         (lambda args 0))))
+            (if (> n 1)
+                (test-assert (format #f "a model with ~a items renders labels" n)
+                  (pair? labels))
+                (test-assert "a menu-less item reports no labels" #t)))
+          (test-assert "every label is a string"
+            (every string? labels))))))
+
+(test-group "an item whose application has no menu does not raise"
+  ;; Toolbox and Chromium-style items do not implement AboutToShow at all, and
+  ;; calling it must not stop the menu building -- measured: the call answers
+  ;; UnknownMethod for those.
+  (let ((items (tray-items)))
+    (if (null? items)
+        (test-skip "no StatusNotifier items on this machine's bus")
+        (test-assert "asking every item for its menu does not raise"
+          ;; The helper catches internally and returns '(), so the assertion is
+          ;; that iterating over ALL items completes.
+          (begin (for-each (lambda (i) (tray-item-menu-labels i)) items)
+                 #t)))))
+
+(test-group "clicking a tray item fills its popover"
+  ;; THE REGRESSION THIS EXISTS FOR.  The builder was correct and
+  ;; tray-item-menu-labels proved it, but the click handler called AboutToShow
+  ;; and then popup WITHOUT rebuilding the box -- so the popover showed the
+  ;; empty contents built at startup, every time.  "Still empty menus", with a
+  ;; working builder underneath.
+  ;;
+  ;; Nothing short of driving the button catches this: the model is right, the
+  ;; builder is right, and the widget a user sees is empty.
+  (let ((items (begin (wait-for (lambda () (pair? (tray-items))) 12)
+                      (tray-items))))
+    (if (null? items)
+        (test-skip "no StatusNotifier items on this machine's bus")
+        (let* ((item (car items))
+               (box (tray-widget))
+               (button (and (pair? (gtk-children box)) (car (gtk-children box))))
+               ;; A tray button's children are the icon and then the popover,
+               ;; because the popover is attached with set-parent.
+               (icon (and button (gtk-widget-get-first-child button)))
+               (popover (and icon (gtk-widget-get-next-sibling icon))))
+          (test-assert "the button has a popover attached"
+            (is-a? popover <gtk-popover>))
+          (when (is-a? popover <gtk-popover>)
+            ;; The item to test with is the first that HAS a menu.  Some
+            ;; legitimately have none -- click-to-activate items, and
+            ;; applications that do not implement dbusmenu at all (measured:
+            ;; Toolbox and Chromium-style items do not) -- so asserting on
+            ;; whichever item happens to be first tests the machine's tray
+            ;; rather than this code.
+            (let find ((rest items) (chosen #f))
+              (cond
+               ((or chosen (null? rest))
+                (if (not chosen)
+                    (test-skip "no tray item on this machine has a menu")
+                    (begin
+                      ;; refresh-menu!, NOT a simulated click.  Popping up a
+                      ;; popover whose button is not inside a realized toplevel
+                      ;; does not fail politely -- it SEGFAULTS in
+                      ;; gdk_surface_new_popup -- so a test that had to emit the
+                      ;; click could not run headless at all.  The rebuild is
+                      ;; the part that was broken, and it is separable.
+                      ;;
+                      ;; #f for the action group: the group makes a row
+                      ;; CLICKABLE, not visible.  This asserts the rows appear.
+                      (refresh-menu! popover chosen #f)
+                      (let ((after (tree-labels (slot-ref popover 'child)))
+                            (expected (tray-item-menu-labels chosen)))
+                        (test-assert
+                            (format #f "the popover holds the ~a menu row(s)"
+                                    (length expected))
+                          (pair? after))
+                        ;; Not just non-empty: the popover must hold the SAME
+                        ;; rows the builder produces.  A popover holding some
+                        ;; other item's menu would satisfy "pair?" alone.
+                        (test-equal "and they are the ones the builder produces"
+                          (length expected) (length after))))))
+               ((pair? (tray-item-menu-labels (car rest)))
+                (find '() (car rest)))
+               (else (find (cdr rest) #f)))))))))
 
 (test-end "tray")

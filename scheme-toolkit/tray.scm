@@ -52,7 +52,9 @@
   #:export (tray-widget
             tray-items
             update-tray!
-            tray-item-menu-labels))
+            tray-item-menu-labels
+            item-menu-model
+            refresh-menu!))
 
 (define-gi-imports "Gtk" "Box" "Button" "Image" "MenuButton" "PopoverMenu" "Widget")
 (define-gi-imports "Gio" "MenuModel" "ActionGroup" "SimpleActionGroup")
@@ -407,28 +409,52 @@ handler, which is what this does."
                   key args))))
     (slot-set! popover 'has-arrow #f)
     (catch #t (lambda () (set-parent popover button)) (lambda args #f))
-    ;; Rebuild the menu contents on EVERY press, after asking the application to
-    ;; populate it.  A menu built once at construction holds the placeholder
-    ;; rows that existed before AboutToShow -- which is nothing.
+
+    ;; Fill it now, and again on every press -- see refresh-menu!.
+    (refresh-menu! popover item group)
     (connect button 'clicked
              (lambda (b)
                (catch #t
                  (lambda ()
-                   (menu-about-to-show! item)
+                   (refresh-menu! popover item group)
                    (popup popover))
                  (lambda (key . args)
                    (format (current-error-port)
                            "scheme-toolkit: tray: cannot open menu: ~a ~s~%"
                            key args)))))
-    ;; Fill it now as well, so a first click has content even if AboutToShow
-    ;; has not been called yet on this item.
-    (catch #t
-      (lambda ()
-        (let ((box (build-menu-box (item-menu-model item) group
-                                   (lambda () (popdown popover)))))
-          (when box (set-child popover box))))
-      (lambda args #f))
     button))
+
+(define (refresh-menu! popover item group)
+  "Fill POPOVER with ITEM's menu, asking the application to populate it first.
+
+CALLED ON EVERY PRESS, not once at construction, and both halves are
+load-bearing.  An earlier version had neither right, which produced a menu that
+was empty in two independent ways:
+
+  - WITHOUT AboutToShow the model still holds its placeholder rows -- measured:
+    2 rows with no labels, then 8 real ones immediately after the call -- so the
+    box built from it is empty;
+  - WITHOUT the REBUILD the popover keeps whatever it was given at construction,
+    which is that empty box, every time.
+
+The second was the harder one to see: the builder was correct and
+tray-item-menu-labels proved it, while the widget a user clicked showed nothing.
+
+Separated from the popup so it can be TESTED without one.  Popping up a popover
+whose button is not in a realized toplevel does not merely fail -- it segfaults
+inside gdk_surface_new_popup -- so a test that had to call popup could not run
+headless at all."
+  (catch #t
+    (lambda ()
+      (menu-about-to-show! item)
+      (let ((box (build-menu-box (item-menu-model item) group
+                                 (lambda () (popdown popover)))))
+        (when box (set-child popover box))
+        box))
+    (lambda (key . args)
+      (format (current-error-port)
+              "scheme-toolkit: tray: cannot build menu: ~a ~s~%" key args)
+      #f)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The widget
