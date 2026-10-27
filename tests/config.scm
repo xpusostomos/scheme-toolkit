@@ -100,29 +100,39 @@
   (test-equal "and the other" 'top (config-value 'test-config 'bar-position)))
 
 (test-group "live reload"
-  ;; Watching needs (scheme-toolkit file)'s monitor-file, which cannot be built
-  ;; at present: G-Golf does not dispatch methods bound from a typelib, so
-  ;; GFile.monitor answers "No applicable method" for every argument type, and
-  ;; the FFI route does not get g_signal_connect_data to take a closure.  The
-  ;; engine side -- reload on demand -- is tested below and works; only the
-  ;; automatic trigger is missing.
+  ;; Its own config and its own file, deliberately.
   ;;
-  ;; Recorded rather than skipped silently, so the gap is visible in the suite.
-  ;; The watch IS registered -- config-live? says so -- it simply never fires,
-  ;; which is the misleading part: a registered watch looks like a working one.
-  (test-assert "reload is manual for now, though the watch is registered"
-    #t)
-  ;; Editing the file and asking for a reload does work, which is what the
-  ;; reload path is for.
-  (write-file test-file "((clock-format . \"MANUAL\"))\n")
-  (config-reload! 'test-config)
-  (test-equal "an explicit reload picks the change up" "MANUAL"
-    (config-value 'test-config 'clock-format)))
+  ;; The groups above rename the shared file to .bad and rewrite it several
+  ;; times, and an inotify watch belongs to an INODE, not a path: once the file
+  ;; has been replaced the original watch is on a file nobody writes to any
+  ;; more.  Sharing a file therefore tests the luck of the ordering rather than
+  ;; the feature.
+  (define reload-file (string-append test-dir "/reload.scm"))
+  (write-file reload-file "()\n")
+  (define-config <reload-config>
+    #:file reload-file
+    (clock-format "%H:%M" string?))
+
+  (test-assert "the file is watched" (config-live? 'reload-config))
+  (write-file reload-file "((clock-format . \"LIVE\"))\n")
+  ;; The monitor delivers on the main loop, so drive it briefly.
+  (define loop (g-main-loop-new #f #f))
+  (g-timeout-add 600 (lambda () (g-main-loop-quit loop) #f))
+  (g-main-loop-run loop)
+  (test-equal "the change was picked up without being asked for" "LIVE"
+    (config-value 'reload-config 'clock-format))
+  ;; An explicit reload still works, for the cases the monitor cannot cover --
+  ;; a file replaced across a filesystem boundary, say.
+  (write-file reload-file "((clock-format . \"MANUAL\"))\n")
+  (config-reload! 'reload-config)
+  (test-equal "and an explicit reload works too" "MANUAL"
+    (config-value 'reload-config 'clock-format)))
 
 ;; Clean up.
 (for-each (lambda (p) (catch #t (lambda () (delete-file p)) (lambda args #f)))
           (list test-file (string-append test-file ".bad")
-                (string-append test-file ".tmp")))
+                (string-append test-file ".tmp")
+                (string-append test-dir "/reload.scm")))
 (catch #t (lambda () (delete-file test-dir)) (lambda args #f))
 
 (test-end "config")

@@ -26,45 +26,36 @@
   (gi-import-by-name "Gio" "File")
   (gi-import-by-name "Gio" "FileMonitor"))
 
-;; Gio's g_file_monitor, called through FFI rather than through G-Golf.
+;; Gio's GFile.monitor_file, imported under an ALIAS.
 ;;
-;; Three problems stack up here, and this is the shortest way past all of them:
+;; The alias is the whole reason this is not a one-liner: Gio binds a method
+;; named `monitor-file' on GFile, and this module exports a procedure of the same
+;; name.  Importing both into one module means the wrapper's own definition
+;; shadows Gio's, so calling `(monitor-file file ...)' from inside it recurses --
+;; an infinite loop with no error to show for it.
 ;;
-;;   1. GFile.monitor_file and this module's own `monitor-file' share a name, so
-;;      importing both makes the wrapper call itself -- an infinite loop rather
-;;      than an error.  GFile.monitor has the same name problem with nothing, so
-;;      it is the one to use.
-;;   2. G-Golf binds Gio's methods but they do not DISPATCH.  The specializers
-;;      are right -- (<g-file> <top> <boolean>) -- and <g-file> is in the
-;;      instance's class precedence list, yet every call answers "No applicable
-;;      method", for a boolean, a real GCancellable, and #f alike.  Custom
-;;      classes defined with define-class dispatch correctly, so this is
-;;      specific to methods bound from a typelib.
-;;   3. There is no top-level `g_file_monitor' to import by name: GIR declares it
-;;      a method, so gi-import-by-name cannot find it.
+;; gi-import-by-name cannot rename, so the import is done into a module of its
+;; own and the method fetched from there.
 ;;
-;; g_file_monitor(file, flags, cancellable, error) returns a GFileMonitor*.  The
-;; flags are 0 because G_FILE_MONITOR_WATCH_MOVES is not needed: this watches a
-;; single config or stylesheet file, and the plain event kinds cover write and
-;; rename.
-(define %g-file-monitor
-  (let ((lib (catch #t (lambda () (dynamic-link "libgio-2.0.so.0"))
-                    (lambda args #f))))
-    (and lib
-         (catch #t
-           (lambda ()
-             (pointer->procedure '*
-                                 (dynamic-func "g_file_monitor" lib)
-                                 (list '* int '* '*)))
-           (lambda args #f)))))
+;; There is no dispatch problem here.  An earlier version of this file claimed
+;; G-Golf fails to dispatch typelib methods; that was wrong, and the mistake cost
+;; hours.  The method takes (file, flags, cancellable) -- THREE arguments -- and
+;; it was being called with two, which correctly answers "No applicable method".
+;; Read the specializer COUNT, not just the classes.
+(define %g-file-monitor-file
+  (let ((m (resolve-module '(scheme-toolkit file gio) #:ensure #t)))
+    (module-use! m (resolve-interface '(g-golf)))
+    (eval '(g-irepository-require "Gio") m)
+    (eval '(gi-import-by-name "Gio" "File") m)
+    (module-ref m 'monitor-file)))
 
-(define (make-file-monitor path)
-  "A GFileMonitor for PATH, or #f when g_file_monitor is unavailable."
-  (if (not %g-file-monitor)
-      #f
-      (let ((p (%g-file-monitor (!g-inst (g-file-new-for-path path))
-                                0 %null-pointer %null-pointer)))
-        (and p (not (null-pointer? p)) p))))
+(define (make-file-monitor path flags)
+  "A GFileMonitor for PATH with FLAGS, or #f.
+
+FLAGS is a list, not a symbol: G-Golf's bitfield conversion maps over the value,
+so a bare 'watch-moves fails with \"Wrong type argument: map\", naming neither
+the flag nor the call."
+  (%g-file-monitor-file (g-file-new-for-path path) flags #f))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reading and writing
@@ -146,126 +137,42 @@ config that silently fails to save is worse than one that says so."
 ;; share one monitor instead of fighting over two.
 (define %monitors (make-hash-table))
 
-(define %monitor-warning-shown? #f)
-
-(define* (monitor-file path proc #:key (recursive? #f) (rate-limit 200))
+(define* (monitor-file path proc #:key (rate-limit 200))
   "Call PROC with (kind path) whenever PATH changes.  Returns a procedure that
 stops this callback.
 
-Watching the same path twice adds a second callback to the same monitor rather
-than starting a second watch.  Returns a no-op stopper, having logged once, if
-file watching is unavailable on this system -- see the note above on why that
-can happen.
+PROC is called for every event kind Gio reports -- `changed',
+`changes-done-hint', `attribute-changed' and the rest.  A caller that only wants
+real content changes should filter.
 
-G-Golf CANNOT BE USED FOR THIS, which is worth stating plainly because it took
-a long time to establish and the workaround is not obvious:
-
-  - GFile.monitor_file and this module's own `monitor-file' share a name, so
-    importing both makes the wrapper call itself -- an infinite loop, not an
-    error.  GFile.monitor avoids that collision.
-  - But G-Golf's methods bound from a TYPELIB DO NOT DISPATCH.  The
-    specializers are correct -- (monitor file cancellable) is
-    (<g-file> <top> <boolean>) -- and <g-file> IS in the instance's class
-    precedence list, yet every call answers \"No applicable method\", for a
-    boolean, a real GCancellable, and #f alike.  Classes defined here with
-    define-class dispatch fine, so this is specific to typelib-bound methods.
-  - And there is no top-level `g_file_monitor' to import by name, because the
-    GIR declares it a method.
-
-So the monitor is created through the C symbol directly.  That needs no GOOPS
-dispatch and is verified working."
+Watching the same path twice adds a second callback to the SAME monitor rather
+than starting a second watch, so two widgets on one config file do not fight.
+The monitor stays referenced for as long as any callback is registered: an
+unreferenced GFileMonitor is collected and its watch then stops with no error."
   (let* ((path (expand-path path))
-         (key (if recursive? (string-append path ":r") path))
-         (entry (hash-ref %monitors key)))
+         (entry (hash-ref %monitors path)))
     (if entry
         (begin
           (set-cdr! entry (cons proc (cdr entry)))
-          (lambda () (%remove-watch! key proc)))
-        (let ((m (make-raw-file-monitor path)))
-          (if (not m)
-              (begin
-                (unless %monitor-warning-shown?
-                  (set! %monitor-warning-shown? #t)
-                  (log-error "file watching unavailable: g_file_monitor not found"
-                             "monitor-file"))
-                (lambda () #f))
-              (begin
-                (hash-set! %monitors key (cons m (list proc)))
-                (%connect-monitor! m
-                                   (lambda (kind)
-                                     (let ((e (hash-ref %monitors key)))
-                                       (when e
-                                         (for-each (lambda (cb) (cb kind path))
-                                                   (cdr e))))))
-                (lambda () (%remove-watch! key proc))))))))
+          (lambda () (%remove-watch! path proc)))
+        (let ((m (make-file-monitor path '(watch-moves))))
+          (when rate-limit (g-file-monitor-set-rate-limit m rate-limit))
+          (hash-set! %monitors path (cons m (list proc)))
+          (connect m 'changed
+                   (lambda (mon file other kind)
+                     (let ((e (hash-ref %monitors path)))
+                       (when e
+                         (for-each (lambda (cb) (cb kind path)) (cdr e))))))
+          (lambda () (%remove-watch! path proc))))))
 
-(define (%remove-watch! key proc)
-  (let ((entry (hash-ref %monitors key)))
+(define (%remove-watch! path proc)
+  (let ((entry (hash-ref %monitors path)))
     (when entry
       (set-cdr! entry (delq proc (cdr entry)))
       (when (null? (cdr entry))
-        (hash-remove! %monitors key)
-        (let ((m (car entry)))
-          (if (procedure? m)
-              (catch #t (lambda () (m)) (lambda args #f))   ; an FFI stopper
-              (catch #t (lambda () (g-file-monitor-cancel m)) (lambda args #f))))))))
-
-;;; ---------------------------------------------------------------------------
-;;; File watching, through the C symbol
-;;; ---------------------------------------------------------------------------
-
-(define %gio-library
-  (catch #t (lambda () (dynamic-link "libgio-2.0.so.0")) (lambda args #f)))
-
-(define %g-file-monitor
-  (and %gio-library
-       (catch #t
-         (lambda ()
-           (pointer->procedure '*
-                               (dynamic-func "g_file_monitor" %gio-library)
-                               (list '* int '* '*)))
-         (lambda args #f))))
-
-(define %g-signal-connect-data
-  (and %gio-library
-       (catch #t
-         (lambda ()
-           (pointer->procedure 'unsigned-long
-                               (dynamic-func "g_signal_connect_data" %gio-library)
-                               (list '* '* '* '* '* int)))
-         (lambda args #f))))
-
-(define %g-file-monitor-cancel
-  (and %gio-library
-       (catch #t
-         (lambda ()
-           (pointer->procedure void
-                               (dynamic-func "g_file_monitor_cancel" %gio-library)
-                               (list '*)))
-         (lambda args #f))))
-
-(define (make-raw-file-monitor path)
-  "A GFileMonitor* for PATH, or #f.  See monitor-file for why this is FFI."
-  (and %g-file-monitor
-       (let ((p (%g-file-monitor (!g-inst (g-file-new-for-path path))
-                                 0 %null-pointer %null-pointer)))
-         (and p (not (null-pointer? p)) p))))
-
-;; A GClosure over a Scheme procedure, which is how a raw-pointer object gets a
-;; signal handler without going through GOOPS dispatch.
-(define (%connect-monitor! monitor proc)
-  (and %g-signal-connect-data
-       (let* ((closure (make <closure>
-                         #:function (lambda (m file other kind) (proc kind))
-                         #:return-type 'none
-                         #:param-types (list '* '* '*)))
-              (g-closure (!g-closure closure)))
-         (%g-signal-connect-data monitor
-                                 (string->pointer "changed")
-                                 g-closure
-                                 %null-pointer
-                                 %null-pointer
-                                 0))))
+        (hash-remove! %monitors path)
+        (catch #t (lambda () (g-file-monitor-cancel (car entry)))
+               (lambda args #f))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; XDG directories

@@ -142,3 +142,42 @@ definition acquires stray identifiers and the failure is
 `run-shell`'s docstring earlier, in a different file.
 
 Avoid a bare `"` in a docstring. Rephrase, or use `\"`.
+
+## "No applicable method" usually means the wrong ARITY
+
+**This one cost hours, chasing a bug that did not exist.** `GFile.monitor_file`
+kept answering
+
+    No applicable method for #<<generic> monitor-file (2)> in call (...)
+
+and the conclusion drawn was that G-Golf fails to dispatch methods bound from a
+typelib. That was wrong: the method takes **three** arguments — `(file flags
+cancellable)` — and it was being called with two. GOOPS was right every time.
+
+The inspection that would have shown it in seconds:
+
+    (for-each (lambda (m) (say "~s" (method-specializers m)))
+              (generic-function-methods monitor-file))
+    ;; => (<g-file> <top> <boolean>)
+    ;;    (<g-file> <top> <g-cancellable>)
+
+Three specializers, therefore three arguments. `generic-function-arity` is not
+exported by this GOOPS, so count the specializers instead.
+
+**Lessons, in the order they would have helped:**
+
+1. When GOOPS says "No applicable method", first check the argument COUNT
+   against the method's specializers. It is by far the most common cause.
+2. Two arguments "not matching" is a strong hint that a third exists — the
+   generic's own name prints its arity, as `monitor-file (2)` did above, and
+   that `(2)` was the generic's class count, not the method's.
+3. The workarounds this wrong diagnosis produced (FFI via `dynamic-link`, a
+   private module to alias the name, a raw-pointer monitor) all "worked" far
+   enough to look like progress, which is what made the mistake durable. If a
+   workaround is needed for a *library* bug, verify the library is actually
+   broken before building around it.
+
+The one real problem in that area is a NAME COLLISION, not dispatch: Gio binds
+`monitor-file` on GFile and `(scheme-toolkit file)` exports `monitor-file`, so
+importing both makes the wrapper call itself. Gio's is imported into a private
+module and fetched from there.
