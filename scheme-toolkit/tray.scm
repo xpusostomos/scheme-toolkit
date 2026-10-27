@@ -446,7 +446,7 @@ substance of it:
                                    #:halign 'start #:hexpand #t
                                    #:use-underline #t))
     (set-child button inner)
-    (connect button 'clicked
+    (connect-signal! button "clicked"
              (lambda (b)
                (cond
                 ((not known)
@@ -460,8 +460,8 @@ substance of it:
                    (lambda (key . args)
                      (format (current-error-port)
                              "scheme-toolkit: tray: action ~a failed: ~a ~s~%"
-                             name key args))))))
-               (when close! (close!)))
+                             name key args)))))
+               (when close! (close!))))
     button))
 
 (define (menu-submenu-button label submodel group close! ancestors budget depth)
@@ -490,7 +490,7 @@ express a submenu that is itself a section of sections."
                      (lambda () (popdown popover) (when close! (close!)))
                      ancestors budget (+ depth 1))
       (set-child popover box))
-    (connect button 'clicked
+    (connect-signal! button "clicked"
              (lambda (b)
                (catch #t (lambda () (popup popover)) (lambda args #f))))
     button))
@@ -558,7 +558,7 @@ handler, which is what this does."
 
     ;; Fill it now, and again on every press -- see refresh-menu!.
     (refresh-menu! popover item group)
-    (connect button 'clicked
+    (connect-signal! button "clicked"
              (lambda (b)
                (catch #t
                  (lambda ()
@@ -704,7 +704,7 @@ registers."
             ;; arguments are not used: the tray is small enough to rebuild
             ;; whole, and reading them correctly is a source of off-by-one
             ;; bugs for no benefit at this size.
-            (connect model 'items-changed
+            (connect-signal! model "items-changed"
                      (lambda (m position removed added)
                        (catch #t
                          (lambda ()

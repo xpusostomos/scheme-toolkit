@@ -45,6 +45,7 @@
             text-node
             apply-css! apply-class!
             child-type set-child-type!
+            connect-signal!
             %element-setup
             %element-children))
 
