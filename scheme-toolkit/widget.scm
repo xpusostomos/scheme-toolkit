@@ -163,7 +163,6 @@ stack showing page one with a \"Child name not found\" warning."
 ;; is that every container the shell uses has one.  When one is missing the
 ;; error names both classes, which is the signal to add a method here.
 (define-generic add-child!)
-(define-generic %remove-child!)
 (define-generic remove-child!)
 
 (define (widget? o) (is-a? o <gtk-widget>))
@@ -233,15 +232,29 @@ stack showing page one with a \"Child name not found\" warning."
 
 ;; Removal mirrors insertion, so a For that removes a child does the same thing
 ;; for every container.
-(define-method (%remove-child! (p <gtk-widget>) (c <gtk-event-controller>) type)
-  (remove-controller p c))
 
-(define-method (%remove-child! (p <gtk-center-box>) (c <gtk-widget>) type)
+;; Every removal method ends here: it keeps %element-children honest.
+;;
+;; Forgetting this was a real bug -- a direct remove-child! took the widget off
+;; the parent but left it on record, so anything reconciling by walking the
+;; record tried to remove a child that was already gone.  A method added from
+;; outside the toolkit must call this too.
+(define (note-removal! p c)
+  (when (and (hash-table? %children) (hashq-ref %children p))
+    (hashq-set! %children p (delq c (hashq-ref %children p))))
+  #t)
+
+(define-method (remove-child! (p <gtk-widget>) (c <gtk-event-controller>) type)
+  (remove-controller p c))
+;; A controller is not a widget, so it was never in %children; no note-removal!.
+
+(define-method (remove-child! (p <gtk-center-box>) (c <gtk-widget>) type)
   (cond ((eq? (slot-ref p 'start-widget) c) (set-start-widget p #f))
         ((eq? (slot-ref p 'end-widget) c) (set-end-widget p #f))
-        ((eq? (slot-ref p 'center-widget) c) (set-center-widget p #f))))
+        ((eq? (slot-ref p 'center-widget) c) (set-center-widget p #f)))
+  (note-removal! p c))
 
-(define-method (%remove-child! (p <gtk-overlay>) (c <gtk-widget>) type)
+(define-method (remove-child! (p <gtk-overlay>) (c <gtk-widget>) type)
   ;; GTK4 gives no way to enumerate an Overlay's children -- there is no
   ;; get_overlay_widgets -- so the only testable case is whether C is the main
   ;; child, which get-child answers.  An overlay added with add-overlay is
@@ -250,23 +263,28 @@ stack showing page one with a \"Child name not found\" warning."
          (remove-overlay p c))
         ((eq? (get-child p) c)
          (set-child p #f))
-        (else #f)))
+        (else #f))
+  (note-removal! p c))
 
-(define-method (%remove-child! (p <gtk-box>) (c <gtk-widget>) type)
-  (remove p c))
+(define-method (remove-child! (p <gtk-box>) (c <gtk-widget>) type)
+  (remove p c)
+  (note-removal! p c))
 
-(define-method (%remove-child! (p <gtk-list-box>) (c <gtk-widget>) type)
-  (remove p c))
+(define-method (remove-child! (p <gtk-list-box>) (c <gtk-widget>) type)
+  (remove p c)
+  (note-removal! p c))
 
-(define-method (%remove-child! (p <gtk-flow-box>) (c <gtk-widget>) type)
-  (remove p c))
+(define-method (remove-child! (p <gtk-flow-box>) (c <gtk-widget>) type)
+  (remove p c)
+  (note-removal! p c))
 
-(define-method (%remove-child! (p <gtk-grid>) (c <gtk-widget>) type)
-  (remove p c))
+(define-method (remove-child! (p <gtk-grid>) (c <gtk-widget>) type)
+  (remove p c)
+  (note-removal! p c))
 
 ;; The generic fallback for a Bin-like parent: clear the child, but only if it
 ;; really is the current one, so removing a stale child does not blank the tree.
-(define-method (%remove-child! (p <gtk-widget>) (c <gtk-widget>) type)
+(define-method (remove-child! (p <gtk-widget>) (c <gtk-widget>) type)
   (cond ((and (class-has-property? (class-of p) 'child)
               (eq? (slot-ref p 'child) c))
          (set-child p #f))
@@ -274,21 +292,9 @@ stack showing page one with a \"Child name not found\" warning."
          #f)                       ; not the current child; nothing to do
         (else
          (error "remove-child!: no method for this parent/child pair"
-                (class-name (class-of p)) (class-name (class-of c))))))
+                (class-name (class-of p)) (class-name (class-of c)))))
+  (note-removal! p c))
 
-;; The public generic: remove, then keep %children honest.
-;;
-;; Without the second half, a direct remove-child! took the widget off the
-;; parent but left it in %element-children.  The tree and the record then
-;; disagreed, so a For reconciling by walking the record would try to remove a
-;; child that was already gone -- and a test would read the wrong count.
-(define (remove-child! p c . rest)
-  (apply %remove-child! p c rest)
-  (when (and (is-a? p <gtk-widget>)
-             (hash-table? %children)
-             (hashq-ref %children p))
-    (hashq-set! %children p (delq c (hashq-ref %children p))))
-  #t)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Fragments
