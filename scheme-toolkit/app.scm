@@ -403,7 +403,14 @@ is what use-modules itself uses, and it loads."
   (catch #t
     (lambda ()
       (let ((iface (resolve-interface '(scheme-toolkit repl))))
-        ((module-ref iface 'start-repl!) #:instance instance)))
+        ((module-ref iface 'start-repl!) #:instance instance)
+        ;; Remove the socket on the way out.  Without this the file outlives
+        ;; the process, `scheme-toolkit list' has to label it "(stale)", and
+        ;; anything that checks for the file rather than for a listener --
+        ;; including the shell's own live tests -- mistakes it for a running
+        ;; shell.
+        (let ((stop (module-ref iface 'stop-repl!)))
+          (connect %app 'shutdown (lambda (a) (catch #t stop (lambda args #f)))))))
     (lambda (key . args)
       (format (current-error-port) "scheme-toolkit: REPL not started: ~a ~s~%"
               key args)
