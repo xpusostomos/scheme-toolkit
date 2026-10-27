@@ -278,11 +278,32 @@ that would cost every shell that never opens a tray menu."
         (and v (g-variant-get-string v))))
     (lambda args #f)))
 
-(define (menu-item-submenu model index)
-  "The submenu MODEL under MODEL's INDEX-th item, or #f."
+;; TWO LINKS, AND THEY MEAN DIFFERENT THINGS.  Keeping them in one accessor was
+;; the bug that lost every separator:
+;;
+;;   section  a GROUP of rows, drawn after a dividing rule -- these are what
+;;            make a menu's internal lines
+;;   submenu  a nested menu, drawn as a row that POPS OUT
+;;
+;; A single `menu-item-submenu' returning either one meant the walk saw a
+;; section as a submenu, took the popout branch, and never reached the rule.
+;; Every menu therefore came out flat, with no dividing line anywhere.
+(define (menu-item-section model index)
+  "The SECTION model under MODEL's INDEX-th item, or #f.
+
+A section is a group of rows, not a row: the walk draws a separator and then
+the section's contents."
   (catch #t
-    (lambda () (or (get-item-link model index "submenu")
-                   (get-item-link model index "section")))
+    (lambda () (get-item-link model index "section"))
+    (lambda args #f)))
+
+(define (menu-item-submenu model index)
+  "The SUBMENU model under MODEL's INDEX-th item, or #f.
+
+A submenu is a row that opens another menu -- distinct from a section, which
+is a group of rows in this one."
+  (catch #t
+    (lambda () (get-item-link model index "submenu"))
     (lambda args #f)))
 
 ;; A model that contains nothing but a single linked section is a WRAPPER: the
@@ -290,13 +311,25 @@ that would cost every shell that never opens a tray menu."
 ;; section holds everything -- so a walk that does not unwrap it renders a
 ;; single row that opens the real menu, which is not what the application drew.
 (define* (menu-unwrap model #:optional (depth 0))
+  "MODEL with any single-item wrapper peeled off.
+
+TWO SHAPES, and missing the second cost a submenu its contents.  A
+Gio.DBusMenuModel wraps its real menu in one item whose link is a SECTION --
+and a submenu reached from it wraps ITS contents the same way.  An earlier
+version followed only \"submenu\", so a submenu arrived still wrapped: it had
+one item, with no label, and the walk rendered nothing for it.  The symptom
+was a Connection submenu that opened EMPTY on a menu whose rows were
+otherwise correct.
+
+A model with one item that has no label and DOES have either link is a
+wrapper, whichever link it uses."
   (if (> depth 4)
       model
       (let ((n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
         (if (and (= n 1)
-                 (not (menu-attribute model 0 "label"))
-                 (menu-item-submenu model 0))
-            (menu-unwrap (menu-item-submenu model 0) (+ depth 1))
+                 (not (menu-attribute model 0 "label")))
+            (let ((inner (menu-item-submenu model 0)))
+              (if inner (menu-unwrap inner (+ depth 1)) model))
             model))))
 
 (define (action-name full-action)
@@ -376,8 +409,14 @@ substance of it:
   unbounded widgets; ANCESTORS catches a model that links to itself."
   (if (or (> depth 16) (memq model ancestors) (<= budget 0))
       box
-      (let ((ancestors (cons model ancestors))
-            (n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
+      ;; UNWRAP HERE, not only at the top.  A submenu passed in from a parent
+      ;; row is wrapped exactly as the root model is -- one item whose link is a
+      ;; section -- so without this the submenu renders as a single unlabelled
+      ;; row.  That was the empty Connection submenu: the parent menu was right
+      ;; and its contents were one level of wrapper away.
+      (let* ((model (menu-unwrap model))
+             (ancestors (cons model ancestors))
+             (n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
         (let loop ((i 0) (budget budget))
           (if (or (>= i n) (<= budget 0))
               box
@@ -426,17 +465,23 @@ substance of it:
          (inner (make <gtk-box> #:orientation 'horizontal))
          (button (make <gtk-button> #:has-frame #f)))
     (gtk-widget-add-css-class button "model-item")
-    ;; SEQUENCED, not used as a value.  `set-sensitive' is a void GTK method, so
-    ;; G-Golf has it return ZERO values -- and `when', which wants one, raises
-    ;; "Zero values returned to single-valued continuation" for the whole call.
-    ;; Inside refresh-menu!'s catch that surfaced as "cannot build menu" and a
-    ;; menu that never appeared at all.
+    ;; SENSITIVE IS SET ALWAYS, not only when the action is known.
     ;;
-    ;; The same shape as gtk-window-set-interactive-debugging in known-issues:
-    ;; a void C setter reached through Scheme where a value is expected.
-    (when known
-      (set-sensitive button (and enabled #t))
-      #t)
+    ;; ags2-shell's line is `set_sensitive(known && get_action_enabled(name))',
+    ;; and its `&&' short-circuits to FALSE when the action is unknown -- so a
+    ;; row naming an action the group does not have comes out INSENSITIVE.
+    ;;
+    ;; This was `(when known (set-sensitive ...))', which skipped an unknown
+    ;; action entirely and left the row ENABLED.  That is why two rows that
+    ;; ags2-shell greys were clickable here: their action is literally named
+    ;; "ls.disabled", the group has no such action, and "not found" was being
+    ;; read as "fine".
+    ;;
+    ;; SEQUENCED, not used as a value.  `set-sensitive' is a void GTK method, so
+    ;; it returns ZERO values and a value-requiring context raises "Zero values
+    ;; returned to single-valued continuation" -- which, inside refresh-menu!'s
+    ;; catch, showed up as "cannot build menu" and no menu at all.
+    (set-sensitive button (and enabled #t))
     ;; The tick, before the label, as ags2-shell places it.
     (when checked
       (let ((check (make <gtk-image> #:icon-name "object-select-symbolic"
