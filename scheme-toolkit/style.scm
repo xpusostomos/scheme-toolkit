@@ -28,13 +28,15 @@
   #:use-module (srfi srfi-11)
   #:use-module (srfi srfi-13)
   #:export (css-rules->string css-rule->string
-            apply-css! apply-provider! reset-css!
+            apply-css! apply-provider! apply-provider-for-display!
+            reset-css!
             css-provider-for
             css-error->string
             %css-providers))
 
 ;; Selective, because a whole-namespace Gtk import costs 2.7 s (see gi.scm).
 (define-gi-imports "Gtk" "Widget" "StyleContext" "CssProvider" "CssSection")
+(define-gi-imports "Gdk" "Display")
 
 ;;; ---------------------------------------------------------------------------
 ;;; The AST
@@ -152,9 +154,16 @@ whole appearance with it."
 (define* (apply-provider! widget provider #:key (priority 800))
   "Attach an existing PROVIDER to WIDGET's style context.  Returns #t or #f.
 
-Separate from apply-css! because a shell wants one provider covering several
-toplevels: parsing the same stylesheet once per monitor is waste, and the
-providers this module holds would otherwise accumulate one copy per window."
+THIS STYLES ONLY WIDGET ITSELF.  That is GTK4's behaviour for
+gtk_style_context_add_provider and it is the opposite of what GTK3 did: a
+provider attached to a widget's context is NOT inherited by its children.  A
+shell that calls this on a toplevel -- the obvious thing -- gets a stylesheet
+that reaches the toplevel and nothing inside it, which looks exactly like a
+stylesheet that failed to load.
+
+Use `apply-provider-for-display!' for a shell's own stylesheet.  This is for the
+per-widget `#:css' prop in (scheme-toolkit widget), where styling one widget is
+the entire intent."
   (catch #t
     (lambda ()
       (add-provider (get-style-context widget) provider priority)
@@ -164,11 +173,52 @@ providers this module holds would otherwise accumulate one copy per window."
               "scheme-toolkit: css: add-provider failed: ~a ~s\n" key rest)
       #f)))
 
+(define* (apply-provider-for-display! provider
+                                      #:key (priority 800) (display #f))
+  "Attach PROVIDER to the DISPLAY, so it styles EVERY widget under it.
+
+This is what a shell's own stylesheet needs, and it is the difference between a
+stylesheet that works and one that appears to do nothing:
+
+  gtk_style_context_add_provider            styles THAT WIDGET only
+  gtk_style_context_add_provider_for_display  styles every widget on the display
+
+GTK4 does not inherit a widget-attached provider to descendants (GTK3 did), so
+applying a shell's stylesheet to each toplevel's context reaches the toplevels
+alone -- every button, label and image inside them keeps the theme's styling.
+The symptom is a stylesheet that parses cleanly, reports no errors, and changes
+nothing, which is a genuinely expensive thing to debug: the CSS is fine, it is
+simply never consulted for the widgets anyone is looking at.
+
+THE NAME IS THE TRAP.  This is a namespace FUNCTION, and G-Golf names those
+after the full C identifier with the prefix kept --
+`gtk-style-context-add-provider-for-display' -- while METHODS get the short name
+(`add-provider').  Looking for `add-provider-for-display' therefore finds
+nothing, and the obvious conclusion is that G-Golf skipped it as deprecated.  It
+did not: the function is present under its long name."
+  (catch #t
+    (lambda ()
+      (let ((d (or display (gdk-display-get-default))))
+        (if (not d)
+            (begin
+              (format (current-error-port)
+                      "scheme-toolkit: css: no display to apply a stylesheet to~%")
+              #f)
+            (begin
+              (gtk-style-context-add-provider-for-display d provider priority)
+              #t))))
+    (lambda (key . rest)
+      (format (current-error-port)
+              "scheme-toolkit: css: add-provider-for-display failed: ~a ~s\n"
+              key rest)
+      #f)))
+
 (define* (apply-css! widget css #:key (priority 800) (on-error #f))
   "Apply CSS to WIDGET's style context.  Returns a list of parse errors.
 
-WIDGET may be any widget; applying to a toplevel covers its whole subtree, which
-is what a shell wants for its stylesheet.
+WIDGET ONLY -- see apply-provider!.  An earlier version of this docstring said
+applying to a toplevel covers its whole subtree, which is GTK3's behaviour and
+is wrong for GTK4.  For a whole stylesheet use apply-provider-for-display!.
 
 ON-ERROR, when given, is called with each error string.  Otherwise they go to
 stderr -- a stylesheet that silently fails to parse is indistinguishable from one
