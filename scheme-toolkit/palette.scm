@@ -93,17 +93,19 @@
           (else #f)))))
 
 ;; Theme files carry a little metadata beside the colours -- Omarchy writes
-;; `mode = "dark"'.  Those keys are KNOWN not to be colours, so warning about
-;; them would train the reader to ignore warnings, which is worse than not
-;; warning at all.
+;; `mode = "dark"'.  Those keys are KEPT but not colour-validated: warning about
+;; them would train the reader to ignore warnings, and DROPPING them loses
+;; information a caller needs.  `mode' in particular is not decoration: a shell
+;; picks its light or dark derivations from it, and a palette reader that
+;; silently discards it makes every consumer guess.
 (define %metadata-keys '(mode scheme name variant author))
 
 (define (valid-colour-or! key value source)
-  "VALUE for KEY if it looks like a colour; otherwise #f with a message.
+  "VALUE for KEY, or #f with a message when it is neither a colour nor metadata.
 
 A theme file with one bad entry should lose that entry, not the whole theme --
 and a metadata entry is not bad, it is simply not a colour."
-  (cond ((memq key %metadata-keys) #f)
+  (cond ((memq key %metadata-keys) value)
         ((colour-string? value) value)
         (else
          (format (current-error-port)

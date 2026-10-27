@@ -93,6 +93,22 @@
     (every (lambda (k) (colour-string? (palette-ref default-palette k)))
            (delq 'mode (palette-keys default-palette)))))
 
+(test-group "metadata is kept, not dropped"
+  ;; `mode' is not decoration: a shell picks its light or dark derivations from
+  ;; it.  The reader used to DISCARD every metadata key while suppressing the
+  ;; warning about it, so every consumer silently got the default -- the shell
+  ;; looked right until the theme changed to light and nothing followed.
+  (let ((p (read-colors-toml
+            (scratch "meta.toml"
+                     "mode = \"light\"\naccent = \"#205EA6\"\n"))))
+    (test-equal "mode is readable" "light" (palette-ref p 'mode))
+    (test-equal "and so is still the accent" "#205EA6" (palette-ref p 'accent)))
+  ;; A non-colour that is NOT metadata is still reported and dropped.
+  (let ((p (read-colors-toml
+            (scratch "meta2.toml"
+                     "mode = \"dark\"\nnonsense = \"not a colour\"\n"))))
+    (test-equal "a real bad value is still dropped" #f (palette-ref p 'nonsense))))
+
 (test-group "emitting CSS variables"
   (let ((css (palette->css-vars
               (make-palette '((accent . "#ff0000") (muted . "#808080"))))))

@@ -44,7 +44,10 @@
   #:use-module (oop goops)
   #:use-module (ice-9 format)
   #:use-module (ice-9 match)
+  #:use-module (ice-9 popen)
+  #:use-module (ice-9 textual-ports)
   #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-13)
   #:export (tray-widget
             tray-items
             update-tray!))
@@ -136,46 +139,93 @@ application drew."
            (lambda args #f)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; The menu
+;;; Making an item's menu appear
 ;;; ---------------------------------------------------------------------------
 
-(define (insert-action-group! button group)
-  "Make GROUP's actions available to BUTTON's menu.
+;; DBusMenu items are populated LAZILY.  Before the host asks, a tray item's
+;; model holds placeholder rows with no labels and no actions -- measured on
+;; this machine: Syncthing's menu is 2 empty rows until AboutToShow, and 8 real
+;; rows immediately after.  So a Gtk.PopoverMenu built from the model at
+;; construction time shows an EMPTY menu, which is exactly what a user sees as
+;; "the menu is broken".
+;;
+;; The host's contract is to call AboutToShow (com.canonical.dbusmenu) on the
+;; item's menu path, wait for the reply, and only then show the menu.  ags2-shell
+;; does this; so does every other tray host.
+;;
+;; NOT EVERY APPLICATION IMPLEMENTS IT.  Measured here: Syncthing and Insync
+;; implement AboutToShow; JetBrains Toolbox and Chromium-style items do not (they
+;; expose Event/GetLayout/GetGroupProperties only).  So the call is
+;; best-effort -- it must not stop the menu appearing, and it must not hang.
+;;
+;; Asked with `gdbus' rather than Gio.DBusConnection.call_async.  The async GI
+;; call needs a closure and a GAsyncReadyCallback, which is a lot of machinery
+;; for a call whose answer we do not even read; `gdbus' is installed wherever a
+;; StatusNotifier host runs, and the subprocess costs a few milliseconds once
+;; per menu OPEN, not per frame.
 
-  (insert-action-group WIDGET PREFIX GROUP)   -- THREE arguments.
+(define (item-menu-address item)
+  "ITEM's (BUS-NAME . OBJECT-PATH) for its dbusmenu, or #f.
 
-Gtk.PopoverMenu resolves a menu item's action against the widget hierarchy: an
-action named \"activate\" is looked up as an action-group on the popover, or on
-an ancestor of it.  A tray item's actions belong to the APPLICATION, so without
-this the menu renders correctly and every row is insensitive -- which reads as
-\"the application does not respond\" rather than \"we forgot the action group\".
+The item id is \"<bus-name>/StatusNotifierItem\"; the menu path is a separate
+property.  Both are needed and neither is derivable from the other."
+  (let ((id (item-attr item 'item-id))
+        (path (item-attr item 'menu-path)))
+    (and (string? id) (string? path) (not (string-null? path))
+         (let ((slash (string-index id #\/)))
+           (and slash (> slash 0)
+                (cons (substring id 0 slash) path))))))
 
-PREFIX is required and must be the EMPTY STRING here.  The menu items the
-application built carry unprefixed action names (\"activate\", \"quit\"), and the
-prefix is what those names are registered under -- anything else and every
-lookup misses.  G-Golf's signature is (widget name group); calling it with two
-arguments raises a goops-error that names neither the missing argument nor this
-requirement."
-  (when group
-    (catch #t
-      (lambda () (insert-action-group button "" group))
-      (lambda (key . args)
-        (format (current-error-port)
-                "scheme-desktop: tray: cannot install action group: ~a ~s~%"
-                key args)))))
+(define (menu-about-to-show! item)
+  "Ask ITEM's application to populate its menu now.  Returns #t if it answered.
+
+Blocking, but only for as long as one dbus round trip -- and a tray menu is
+opened by a click, not in a loop."
+  (let ((address (item-menu-address item)))
+    (if (not address)
+        #f
+        (catch #t
+          (lambda ()
+            (let* ((cmd (format #f "gdbus call --session --dest ~a --object-path ~a ~
+--method com.canonical.dbusmenu.AboutToShow 0 2>/dev/null"
+                                (car address) (cdr address)))
+                   (p (open-input-pipe cmd))
+                   (out (get-string-all p)))
+              (close-pipe p)
+              ;; The reply is "(false,)" or "(true,)"; a missing method gives
+              ;; empty output, which is the common case and not an error.
+              (and out (not (string-null? (string-trim out))) #t)))
+          (lambda args #f)))))
+
+(define (item-action-prefix item)
+  "The prefix ITEM's actions are registered under.
+
+A StatusNotifier item exports its actions under a namespace derived from its own
+id -- ags2-shell uses `itemId` up to the first \"/\".  The menu's action
+attributes are unprefixed names, and Gtk resolves them as PREFIX.NAME, so the
+prefix is what makes them findable.  The empty string is not always right, which
+is what made every row of a first attempt insensitive."
+  (let ((id (item-attr item 'item-id)))
+    (if (and (string? id) (not (string-null? id)))
+        id
+        "")))
+
+(define (make-item-popover item)
+  "A fresh Gtk.PopoverMenu for ITEM's (current) menu model, or #f."
+  (let ((section (item-menu-model item)))
+    (and section (make <gtk-popover-menu> #:menu-model section))))
 
 (define* (tray-menu-button item #:optional (class "tray-item") (icon-size 16))
   "A MenuButton for ITEM: its icon, and its application's menu on click.
 
 CLASS and ICON-SIZE are the caller's choices, which is why this is not
-hard-coded: a bar's icon size and CSS class are that shell's decision."
-  (let* ((section (item-menu-model item))
-         (group (item-attr item 'action-group))
-         ;; A PopoverMenu built from the item's own section -- NOT from the
-         ;; menu bar, which would nest one row deep.
-         (popover (if section
-                      (make <gtk-popover-menu> #:menu-model section)
-                      #f))
+hard-coded: a bar's icon size and CSS class are that shell's decision.
+
+The popover is REBUILT each time the button is pressed.  It cannot be built once
+at construction, because the application's menu is empty until AboutToShow is
+called -- see the note above -- so a popover made here and never refreshed would
+always be blank."
+  (let* ((group (item-attr item 'action-group))
          (button (element <gtk-menu-button>
                           #:class class
                           #:tooltip-text (item-tooltip item)
@@ -184,11 +234,33 @@ hard-coded: a bar's icon size and CSS class are that shell's decision."
                           #:always-show-arrow #f
                           (element <gtk-image> #:gicon (item-icon item)
                                    #:pixel-size icon-size))))
-    (when popover
-      ;; The action group goes on the BUTTON, which is an ancestor of the
-      ;; popover -- see insert-action-group!.
-      (insert-action-group! button group)
-      (slot-set! button 'popover popover))
+    ;; The action group goes on the BUTTON, an ancestor of the popover, or the
+    ;; menu renders with every row INSENSITIVE -- see insert-action-group!.
+    ;; The prefix comes from the item, not a hard-coded "".
+    (when group
+      (catch #t
+        (lambda () (insert-action-group button (item-action-prefix item) group))
+        (lambda (key . args)
+          (format (current-error-port)
+                  "scheme-toolkit: tray: cannot install action group: ~a ~s~%"
+                  key args))))
+    ;; Build the first popover now so the button has a menu from the start...
+    (let ((popover (make-item-popover item)))
+      (when popover (slot-set! button 'popover popover)))
+    ;; ...and REBUILD it on every press, after asking the application to fill
+    ;; its menu in.  Without this the popover keeps the placeholder rows that
+    ;; existed at construction and the menu is empty every time.
+    (connect button 'activate
+             (lambda (b)
+               (catch #t
+                 (lambda ()
+                   (menu-about-to-show! item)
+                   (let ((fresh (make-item-popover item)))
+                     (when fresh (slot-set! b 'popover fresh))))
+                 (lambda (key . args)
+                   (format (current-error-port)
+                           "scheme-toolkit: tray: cannot open menu: ~a ~s~%"
+                           key args)))))
     button))
 
 ;;; ---------------------------------------------------------------------------
