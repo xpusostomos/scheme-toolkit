@@ -92,6 +92,33 @@
   (c)
   (test-equal "recomputes when read while still cold" 2 reads))
 
+(test-group "st-peek inside a computed does not track"
+  ;; The distinction that is easy to get backwards, and the cost of getting it
+  ;; backwards is a value that never updates.
+  ;;
+  ;;   (acc)        read AND record a dependency
+  ;;   (st-peek acc) read WITHOUT recording one
+  ;;
+  ;; A computed is a function of what it READS, so reading a source with
+  ;; st-peek means the source is never listed among its dependencies: the
+  ;; computed is never told, and it serves its cached value forever.  The
+  ;; launcher's results accessor had exactly this and stayed empty while its
+  ;; query changed.
+  (define-values (src set-src!) (create-state "a"))
+  (define tracked (create-computed (lambda () (string-append (src) "!"))))
+  (test-equal "a tracked read sees the value" "a!" (st-peek tracked))
+  (set-src! "b")
+  (test-equal "and updates when the source changes" "b!" (st-peek tracked))
+
+  (define-values (src2 set-src2!) (create-state "a"))
+  (define untracked (create-computed (lambda () (string-append (st-peek src2) "!"))))
+  (test-equal "an untracked read sees the value once" "a!" (st-peek untracked))
+  (set-src2! "b")
+  ;; Stale, and this is the ASSERTION OF THE BUG rather than a desired
+  ;; behaviour: it documents why a computed must not use st-peek on its own
+  ;; sources.  If this ever starts returning "b!" the tracking rules changed.
+  (test-equal "but never learns that it changed" "a!" (st-peek untracked)))
+
 (test-group "create-memo"
   (define-values (n set-n!) (create-state 1))
   (define sign (create-memo (lambda () (if (> (n) 0) 'pos 'nonpos))))
