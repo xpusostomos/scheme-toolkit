@@ -141,35 +141,26 @@ machine: `icon-name' is a string on some items and a non-string on others.)"
           (else #f))))
 
 (define (item-menu-model item)
-  "A Gio.MenuModel for ITEM's menu, or #f.
+  "A Gio.MenuModel for ITEM's menu, or #f -- EXACTLY AS PUBLISHED.
 
-Measured against the real items on this machine: an AstalTray item's
-`menu-model' is a Gio.DBusMenuModel with exactly ONE item, and that item links
-to the application's real menu under `section' -- not `submenu'.  Asking for
-`submenu' answers #f for every item, which builds a button that opens nothing
-and looks exactly like an application whose menu is broken.
+DO NOT UNWRAP IT HERE, and that mistake cost Close and a separator.
 
-Both are tried, in that order, because which one a StatusNotifier host uses is
-its own choice; the DBusMenu case is simply what is here.
-  (get-n-items model)      => 1
-  (get-item-link m 0 \"submenu\") => #f
-  (get-item-link m 0 \"section\") => <d-bus-menu-section-model>
+The model is a list of SECTIONS.  Measured on Syncthing:
 
-The section (or submenu) is what a Gtk.PopoverMenu wants.  Handing it the
-outer model instead shows a single row that opens a submenu -- not what the
-application drew."
-  (let ((model (item-attr item 'menu-model)))
-    (and model
-         (catch #t
-           (lambda ()
-             (let ((n (get-n-items model)))
-               (and (> n 0)
-                    (or (get-item-link model 0 "section")
-                        (get-item-link model 0 "submenu")
-                        ;; No wrapper at all: some hosts hand over the menu
-                        ;; directly, and then the model IS the section.
-                        model))))
-           (lambda args #f)))))
+    raw model n_items = 2
+      0: no label, SECTION -> the eight rows (Open .. About)
+      1: no label, SECTION -> the separator and Close
+
+An earlier version of this looked at item 0, saw a section link, and returned
+THAT section -- discarding item 1 and everything after it.  Close and its
+dividing rule were in the model the whole time and were deleted before the walk
+ever saw them.  It also made the count look wrong (\"8, not 11\") and sent the
+search after Gio, Astal and GLib versions, none of which were at fault.
+
+ags2-shell hands `item.menuModel` straight to its walk and lets the walk draw a
+separator before every section but the first.  This does the same: the model is
+returned untouched and (model->widgets) handles the sections."
+  (item-attr item 'menu-model))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Making an item's menu appear
@@ -313,31 +304,16 @@ is a group of rows in this one."
     (lambda () (get-item-link model index "submenu"))
     (lambda args #f)))
 
-;; A model that contains nothing but a single linked section is a WRAPPER: the
-;; real menu is inside.  Gio.DBusMenuModel is shaped this way -- one item whose
-;; section holds everything -- so a walk that does not unwrap it renders a
-;; single row that opens the real menu, which is not what the application drew.
-(define* (menu-unwrap model #:optional (depth 0))
-  "MODEL with any single-item wrapper peeled off.
-
-TWO SHAPES, and missing the second cost a submenu its contents.  A
-Gio.DBusMenuModel wraps its real menu in one item whose link is a SECTION --
-and a submenu reached from it wraps ITS contents the same way.  An earlier
-version followed only \"submenu\", so a submenu arrived still wrapped: it had
-one item, with no label, and the walk rendered nothing for it.  The symptom
-was a Connection submenu that opened EMPTY on a menu whose rows were
-otherwise correct.
-
-A model with one item that has no label and DOES have either link is a
-wrapper, whichever link it uses."
-  (if (> depth 4)
-      model
-      (let ((n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
-        (if (and (= n 1)
-                 (not (menu-attribute model 0 "label")))
-            (let ((inner (menu-item-submenu model 0)))
-              (if inner (menu-unwrap inner (+ depth 1)) model))
-            model))))
+;; `menu-unwrap' used to live here.  It peeled a single-section wrapper off a
+;; model, and it was the source of the worst bug in this file: applied to a
+;; menu whose TOP LEVEL is several sections, it returned the first and threw
+;; the rest away, so a menu's trailing rule and Close never reached the walk.
+;;
+;; Nothing needs it.  A section is not a wrapper to be removed -- it is a row of
+;; the model, and `row->widgets' handles it: a section contributes a dividing
+;; rule (unless it is first) and then its contents, recursively.  That is what
+;; ags2-shell's walk does, and it is correct for a wrapper and for a menu of
+;; several sections alike.
 
 (define (action-name full-action)
   "FULL-ACTION with its prefix stripped: \"dbusmenu.id-10\" -> \"id-10\".
@@ -435,8 +411,7 @@ than a counter to thread: DEPTH (a menu has few levels) and ANCESTORS (a model
 that links to itself)."
   (if (or (> depth %max-menu-depth) (memq model ancestors))
       '()
-      (let* ((model (menu-unwrap model))
-             (ancestors (cons model ancestors)))
+      (let ((ancestors (cons model ancestors)))
         (append-map (lambda (i) (row->widgets model i group close! ancestors depth))
                     (list-model-indices model)))))
 
@@ -573,8 +548,7 @@ express a submenu that is itself a section of sections."
   "A Gtk.Box of rows for MODEL, or #f when there is nothing to show."
   (if (not model)
       #f
-      (let* ((model (menu-unwrap model))
-             (box (make <gtk-box> #:orientation 'vertical)))
+      (let ((box (make <gtk-box> #:orientation 'vertical)))
         ;; The class ags2-shell puts on a menu box, and what its stylesheet
         ;; targets: `window#bar popover contents .tray-menu { min-width: ... }'
         ;; plus the padding rules for `button.model-item' and `separator'.
@@ -858,7 +832,7 @@ symptom is that nothing happens.
 Useful from a REPL on a tray item that does not respond."
   (catch #t
     (lambda ()
-      (let* ((model (menu-unwrap (item-menu-model item)))
+      (let* ((model (item-menu-model item))
              (group (item-attr item 'action-group))
              (n (if model (get-n-items model) 0)))
         (let loop ((i 0) (out '()))
