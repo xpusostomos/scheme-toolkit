@@ -567,3 +567,53 @@ what the per-widget `#:css` prop wants.
 an unmistakable colour to a class on a DESCENDANT and read it back.
 
     (gtk-widget-get-color child)   ; (1.0 0.0 0.0 1.0) if the rule reached it
+
+## A tray menu: four separate traps, all producing "the menu is empty"
+
+Every one of these presented identically -- a popover with nothing in it -- and
+each had to be found separately. The list is worth keeping because the symptom
+never narrows down which one it is.
+
+**1. `GtkMenuButton` has no `activate` signal.** A handler connected to it never
+runs, so "refresh the menu when the button is clicked" silently does nothing.
+`GtkMenuButton` is not a `GtkButton`. Use a plain `Gtk.Button` (which emits
+`clicked`) with a `Gtk.Popover` parented to it -- which is what ags2-shell does.
+
+**2. `Gtk.PopoverMenu` cannot render a `Gio.DBusMenuModel`.** Measured: after
+`AboutToShow` the model reports 8 items, the attributes read back correctly
+("Open Syncthing", "Settings", ...), and the popover still shows nothing. The
+model is fine; the widget cannot draw it. ags2-shell does not use PopoverMenu
+for tray menus either -- it walks the model and builds buttons by hand.
+
+**3. `get-item-attribute-value` silently answers `#f` without a GVariantType.**
+
+    (get-item-attribute-value MODEL INDEX ATTRIBUTE VARIANT-TYPE)
+
+Passing `#f`, or the string `"s"`, returns `#f` for **every** item while real
+menu items are present. The natural reading is "the model has no labels", which
+sends the search to the model rather than the call. It must be a real type:
+`(g-variant-type-new "s")`, which G-Golf returns as a `<foreign>` -- that
+`<foreign>` is correct and works. The result is a `GVariant` pointer, read with
+`g-variant-get-string`.
+
+**4. `AboutToShow` populates the model, and not every application implements it.**
+DBusMenu menus are lazy: before the host asks, the model holds placeholder rows
+with no labels and no actions. Measured on Syncthing: 2 empty rows, then 8 real
+ones immediately after `AboutToShow`. Measured across five items on this
+machine: Syncthing and Insync implement it, JetBrains Toolbox and Chromium-style
+items do not (`UnknownMethod`). So the call is best-effort and must not stop the
+menu appearing.
+
+Two more things that are easy to get wrong once the walk works:
+
+- **A `Gio.DBusMenuModel` is a WRAPPER** -- one item whose *section* holds the
+  real menu. A walk that does not unwrap it renders a single row which opens the
+  menu, rather than the menu. `get-item-link model 0 "section"` is the unwrap.
+- **Bound the recursion.** A model that links to itself spins forever.
+
+**And a testing lesson.** The first version of the verification helper walked
+only DIRECT children and reported an empty menu that had in fact been built --
+the labels sit at `button > box > label`. A test asserting on the *model* would
+have passed throughout all four bugs above, because the model was always
+correct. `tray-item-menu-labels` therefore builds the same box the popover gets
+and reports what a user would SEE.
