@@ -47,10 +47,12 @@
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
   #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-11)
   #:use-module (srfi srfi-13)
   #:export (tray-widget
             tray-items
-            update-tray!))
+            update-tray!
+            tray-item-menu-labels))
 
 (define-gi-imports "Gtk" "Box" "Button" "Image" "MenuButton" "PopoverMenu" "Widget")
 (define-gi-imports "Gio" "MenuModel" "ActionGroup" "SimpleActionGroup")
@@ -210,33 +212,192 @@ is what made every row of a first attempt insensitive."
         id
         "")))
 
+;;; ---------------------------------------------------------------------------
+;;; Rendering a menu model by hand
+;;; ---------------------------------------------------------------------------
+;;
+;; Gtk.PopoverMenu DOES NOT WORK WITH THESE MODELS, which is why this section
+;; exists.  A tray item's menu-model is a Gio.DBusMenuModel, and PopoverMenu
+;; renders it as an empty popup -- measured: the model reports 8 items after
+;; AboutToShow and the popover still shows nothing.  ags2-shell does not use
+;; PopoverMenu for tray menus either; it walks the model and builds buttons.
+;; This is that, in Scheme.
+;;
+;; The walk needs three things per item, each read as a GVariant:
+;;
+;;   (get-item-attribute-value MODEL INDEX ATTRIBUTE VARIANT-TYPE)
+;;
+;; The VARIANT-TYPE argument is where this is easy to get wrong.  Passing #f or
+;; a plain string answers #f for every item -- silently, with real menu items
+;; present -- and the natural conclusion is that the model has no labels.  It
+;; must be a GVariantType, which G-Golf spells g-variant-type-new, and which
+;; comes back as a <foreign> that works perfectly well.
+
+(define %string-variant-type #f)
+
+(define (string-variant-type)
+  "A GVariantType for \"s\", created once.
+
+Lazily, because the GLib typelib has to be required first, and at module load
+that would cost every shell that never opens a tray menu."
+  (unless %string-variant-type
+    (g-irepository-require "GLib" #:version "2.0")
+    (gi-import-by-name "GLib" "VariantType")
+    (set! %string-variant-type (g-variant-type-new "s")))
+  %string-variant-type)
+
+(define (menu-attribute model index attribute)
+  "MODEL's INDEX-th item's ATTRIBUTE as a string, or #f."
+  (catch #t
+    (lambda ()
+      (let ((v (get-item-attribute-value model index attribute (string-variant-type))))
+        (and v (g-variant-get-string v))))
+    (lambda args #f)))
+
+(define (menu-item-submenu model index)
+  "The submenu MODEL under MODEL's INDEX-th item, or #f."
+  (catch #t
+    (lambda () (or (get-item-link model index "submenu")
+                   (get-item-link model index "section")))
+    (lambda args #f)))
+
+;; A model that contains nothing but a single linked section is a WRAPPER: the
+;; real menu is inside.  Gio.DBusMenuModel is shaped this way -- one item whose
+;; section holds everything -- so a walk that does not unwrap it renders a
+;; single row that opens the real menu, which is not what the application drew.
+(define* (menu-unwrap model #:optional (depth 0))
+  (if (> depth 4)
+      model
+      (let ((n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
+        (if (and (= n 1)
+                 (not (menu-attribute model 0 "label"))
+                 (menu-item-submenu model 0))
+            (menu-unwrap (menu-item-submenu model 0) (+ depth 1))
+            model))))
+
+(define* (build-menu-box model group close! #:optional (depth 0))
+  "A Gtk.Box of buttons for MODEL, or #f when there is nothing to show.
+
+DEPTH bounds the recursion: a model that links to itself would otherwise spin
+forever, and a tray menu four levels deep is not a thing anyone has."
+  (if (> depth 4)
+      #f
+      (let* ((model (menu-unwrap model))
+             (n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
+        (if (<= n 0)
+            #f
+            (let ((box (make <gtk-box> #:orientation 'vertical)))
+              (let loop ((i 0))
+                (when (< i n)
+                  (let ((label (menu-attribute model i "label"))
+                        (action (menu-attribute model i "action"))
+                        (sub (menu-item-submenu model i)))
+                    (cond
+                     ;; A separator has neither label nor action.
+                     ((and (not label) (not action) (not sub))
+                      (append box (make <gtk-separator>
+                                        #:orientation 'horizontal)))
+                     (sub
+                      ;; A submenu: a button that opens another box.  Bounded
+                      ;; by DEPTH.
+                      (let ((sub-box (build-menu-box sub group close!
+                                                     (+ depth 1))))
+                        (when (and label sub-box)
+                          (append box (menu-submenu-button label sub-box)))))
+                     (label
+                      (append box
+                              (menu-action-button label action group close!)))))
+                  (loop (+ i 1))))
+              box)))))
+
+(define (menu-action-button label action group close!)
+  "A button for a labelled menu item, wired to GROUP's ACTION."
+  (let* ((inner (make <gtk-box> #:orientation 'horizontal))
+         (button (make <gtk-button> #:has-frame #f)))
+    (gtk-widget-add-css-class button "model-item")
+    (append inner (make <gtk-label> #:label label #:xalign 0
+                                     #:hexpand #t
+                                     #:use-underline #t))
+    (set-child button inner)
+    (connect button 'clicked
+             (lambda (b)
+               (when (and group action (not (string-null? action)))
+                 (catch #t
+                   (lambda () (activate-action group action #f))
+                   (lambda (key . args)
+                     (format (current-error-port)
+                             "scheme-toolkit: tray: action ~a failed: ~a~%"
+                             action key))))
+               (when close! (close!))))
+    button))
+
+(define (menu-submenu-button label sub-box)
+  "A button that reveals SUB-BOX in place.
+
+Revealed rather than popped up in a second window: a nested popover inside a
+popover is a well-known source of focus bugs in GTK, and ags2-shell's animated
+popover exists mostly to work around that."
+  (let* ((inner (make <gtk-box> #:orientation 'horizontal))
+         (button (make <gtk-button> #:has-frame #f)))
+    (gtk-widget-add-css-class button "model-item")
+    (gtk-widget-add-css-class button "submenu")
+    (append inner (make <gtk-label> #:label label #:xalign 0
+                                     #:hexpand #t #:use-underline #t))
+    (append inner (make <gtk-image> #:icon-name "go-next-symbolic"
+                                     #:valign 'center))
+    (set-child button inner)
+    ;; The submenu lives inside a Revealer under the button, so the popover
+    ;; grows rather than spawning a window.
+    (let ((holder (make <gtk-box> #:orientation 'vertical)))
+      (append holder button)
+      (append holder sub-box)
+      (connect button 'clicked
+               (lambda (b)
+                 (set-visible sub-box (not (slot-ref sub-box 'visible)))))
+      holder)))
+
 (define (make-item-popover item)
-  "A fresh Gtk.PopoverMenu for ITEM's (current) menu model, or #f."
-  (let ((section (item-menu-model item)))
-    (and section (make <gtk-popover-menu> #:menu-model section))))
+  "A Gtk.Popover holding ITEM's menu, built by hand, or #f.
+
+NOT a Gtk.PopoverMenu: see the note above -- PopoverMenu renders a DBusMenuModel
+as an empty popup, which is the \"the menu is empty\" bug this replaces."
+  (let ((section (item-menu-model item))
+        (group (item-attr item 'action-group)))
+    (and section
+         (let* ((popover (make <gtk-popover>))
+                (box (build-menu-box section group
+                                     (lambda () (popdown popover)))))
+           (and box
+                (begin (set-child popover box) popover))))))
 
 (define* (tray-menu-button item #:optional (class "tray-item") (icon-size 16))
-  "A MenuButton for ITEM: its icon, and its application's menu on click.
+  "A button for ITEM: its icon, opening ITEM's application menu on click.
 
 CLASS and ICON-SIZE are the caller's choices, which is why this is not
 hard-coded: a bar's icon size and CSS class are that shell's decision.
 
-The popover is REBUILT each time the button is pressed.  It cannot be built once
-at construction, because the application's menu is empty until AboutToShow is
-called -- see the note above -- so a popover made here and never refreshed would
-always be blank."
+A PLAIN Gtk.Button, not a Gtk.MenuButton.  Two reasons, both measured:
+
+  - GtkMenuButton has NO `activate' signal, so a handler attached to one never
+    runs.  The first version of this file connected `activate' to refresh the
+    menu on click; it never fired, which is why the menu stayed empty.
+
+  - GtkMenuButton wants a Gio.MenuModel and renders it with PopoverMenu, which
+    cannot render a DBusMenuModel at all.
+
+ags2-shell uses a plain button with a popover parented to it and an `onClicked'
+handler, which is what this does."
   (let* ((group (item-attr item 'action-group))
-         (button (element <gtk-menu-button>
-                          #:class class
-                          #:tooltip-text (item-tooltip item)
-                          ;; A menu button with no menu must not open an empty
-                          ;; popover: some items are click-to-activate only.
-                          #:always-show-arrow #f
-                          (element <gtk-image> #:gicon (item-icon item)
-                                   #:pixel-size icon-size))))
-    ;; The action group goes on the BUTTON, an ancestor of the popover, or the
-    ;; menu renders with every row INSENSITIVE -- see insert-action-group!.
-    ;; The prefix comes from the item, not a hard-coded "".
+         (popover (make <gtk-popover>))
+         (button (make <gtk-button> #:has-frame #f)))
+    (gtk-widget-add-css-class button class)
+    (when (item-tooltip item)
+      (set-tooltip-text button (item-tooltip item)))
+    (set-child button (make <gtk-image> #:gicon (item-icon item)
+                                        #:pixel-size icon-size))
+    ;; The action group must be on an ANCESTOR of the buttons that reference
+    ;; its actions -- the popover's contents are built inside it below, and the
+    ;; popover is parented to the button, so the button is that ancestor.
     (when group
       (catch #t
         (lambda () (insert-action-group button (item-action-prefix item) group))
@@ -244,23 +405,29 @@ always be blank."
           (format (current-error-port)
                   "scheme-toolkit: tray: cannot install action group: ~a ~s~%"
                   key args))))
-    ;; Build the first popover now so the button has a menu from the start...
-    (let ((popover (make-item-popover item)))
-      (when popover (slot-set! button 'popover popover)))
-    ;; ...and REBUILD it on every press, after asking the application to fill
-    ;; its menu in.  Without this the popover keeps the placeholder rows that
-    ;; existed at construction and the menu is empty every time.
-    (connect button 'activate
+    (slot-set! popover 'has-arrow #f)
+    (catch #t (lambda () (set-parent popover button)) (lambda args #f))
+    ;; Rebuild the menu contents on EVERY press, after asking the application to
+    ;; populate it.  A menu built once at construction holds the placeholder
+    ;; rows that existed before AboutToShow -- which is nothing.
+    (connect button 'clicked
              (lambda (b)
                (catch #t
                  (lambda ()
                    (menu-about-to-show! item)
-                   (let ((fresh (make-item-popover item)))
-                     (when fresh (slot-set! b 'popover fresh))))
+                   (popup popover))
                  (lambda (key . args)
                    (format (current-error-port)
                            "scheme-toolkit: tray: cannot open menu: ~a ~s~%"
                            key args)))))
+    ;; Fill it now as well, so a first click has content even if AboutToShow
+    ;; has not been called yet on this item.
+    (catch #t
+      (lambda ()
+        (let ((box (build-menu-box (item-menu-model item) group
+                                   (lambda () (popdown popover)))))
+          (when box (set-child popover box))))
+      (lambda args #f))
     button))
 
 ;;; ---------------------------------------------------------------------------
@@ -377,3 +544,43 @@ registers."
                                    key args)))))))))
     (update-tray! box #:class item-class #:icon-size icon-size)
     box))
+
+;;; ---------------------------------------------------------------------------
+;;; Diagnostics
+;;; ---------------------------------------------------------------------------
+
+(define (widget-labels widget)
+  "Every label's text under WIDGET, in tree order.
+
+RECURSIVE, because a menu row is button > box > label and a walk of direct
+children only finds nothing -- which is exactly how this helper first reported
+an empty menu that was in fact built."
+  (let loop ((child (gtk-widget-get-first-child widget)) (out '()))
+    (if (not child)
+        (reverse out)
+        (loop (gtk-widget-get-next-sibling child)
+              (cond ((is-a? child <gtk-label>)
+                     (cons (catch #t (lambda () (slot-ref child 'label))
+                                  (lambda args ""))
+                           out))
+                    (else
+                     (append (reverse (widget-labels child)) out)))))))
+
+(define (tray-item-menu-labels item)
+  "The labels ITEM's application menu would show, in order, or '().
+
+For tests and for a shell that wants to log what a tray item offers.  It builds
+the same box the popover gets, so it reports what a user would see rather than
+what the model claims -- which is the distinction that mattered here: the model
+reported 8 items while the popover showed nothing."
+  (catch #t
+    (lambda ()
+      (menu-about-to-show! item)
+      (let ((box (build-menu-box (item-menu-model item)
+                                 (item-attr item 'action-group)
+                                 (lambda () #f))))
+        (if box (widget-labels box) '())))
+    (lambda (key . args)
+      (format (current-error-port)
+              "scheme-toolkit: tray: cannot read menu: ~a ~s~%" key args)
+      '())))
