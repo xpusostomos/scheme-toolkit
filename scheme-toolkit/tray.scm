@@ -278,41 +278,6 @@ that would cost every shell that never opens a tray menu."
             (menu-unwrap (menu-item-submenu model 0) (+ depth 1))
             model))))
 
-(define* (build-menu-box model group close! #:optional (depth 0))
-  "A Gtk.Box of buttons for MODEL, or #f when there is nothing to show.
-
-DEPTH bounds the recursion: a model that links to itself would otherwise spin
-forever, and a tray menu four levels deep is not a thing anyone has."
-  (if (> depth 4)
-      #f
-      (let* ((model (menu-unwrap model))
-             (n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
-        (if (<= n 0)
-            #f
-            (let ((box (make <gtk-box> #:orientation 'vertical)))
-              (let loop ((i 0))
-                (when (< i n)
-                  (let ((label (menu-attribute model i "label"))
-                        (action (menu-attribute model i "action"))
-                        (sub (menu-item-submenu model i)))
-                    (cond
-                     ;; A separator has neither label nor action.
-                     ((and (not label) (not action) (not sub))
-                      (append box (make <gtk-separator>
-                                        #:orientation 'horizontal)))
-                     (sub
-                      ;; A submenu: a button that opens another box.  Bounded
-                      ;; by DEPTH.
-                      (let ((sub-box (build-menu-box sub group close!
-                                                     (+ depth 1))))
-                        (when (and label sub-box)
-                          (append box (menu-submenu-button label sub-box)))))
-                     (label
-                      (append box
-                              (menu-action-button label action group close!)))))
-                  (loop (+ i 1))))
-              box)))))
-
 (define (action-name full-action)
   "FULL-ACTION with its prefix stripped: \"dbusmenu.id-10\" -> \"id-10\".
 
@@ -327,79 +292,191 @@ ags2-shell strips it the same way (`action_name' in TrayMenu.tsx)."
   (let ((dot (and (string? full-action) (string-index full-action #\.))))
     (if dot (substring full-action (+ dot 1)) full-action)))
 
-(define (menu-action-button label action group close!)
-  "A button for a labelled menu item, wired to GROUP's ACTION.
+(define (menu-target model index)
+  "MODEL's INDEX-th item's \"target\" attribute, or #f.
 
-An action the group does not have is reported rather than ignored: the row is
-already on screen and clickable by then, so a silent no-op is the one outcome a
-user cannot diagnose."
-  (let* ((inner (make <gtk-box> #:orientation 'horizontal))
+Needed because a radio or checkbox item carries its VALUE in the target, and
+that is what decides whether the row shows a tick."
+  (catch #t
+    (lambda () (get-item-attribute-value model index "target" #f))
+    (lambda args #f)))
+
+(define (action-checked? group name target)
+  "Does GROUP's NAME action consider TARGET its current state?
+
+A boolean state is the simple case; a radio item's state is a string and is
+compared against the target.  ags2-shell's is_checked, in Scheme."
+  (if (not (and group name (has-action group name)))
+      #f
+      (catch #t
+        (lambda ()
+          (let ((state (get-action-state group name)))
+            (cond
+             ((not state) #f)
+             ;; A string state (a radio group) equals its target; a boolean one
+             ;; is simply true, or equal to a boolean target.
+             ((string? state) (and target (equal? state (variant->value target))))
+             (else (if target
+                       (equal? state (variant->value target))
+                       (eq? state #t))))))
+        (lambda args #f))))
+
+(define (variant->value v)
+  "A GVariant's Scheme value, best-effort: string or boolean."
+  (catch #t
+    (lambda ()
+      (cond ((string? v) v)
+            ((not v) #f)
+            (else (or (catch #t (lambda () (g-variant-get-string v)) (lambda a #f))
+                      #t))))
+    (lambda args #f)))
+
+;;; ---------------------------------------------------------------------------
+;;; Building the menu
+;;; ---------------------------------------------------------------------------
+
+(define %menu-budget 200)
+
+(define* (append-model! box model group close! ancestors budget depth)
+  "Append MODEL's rows to BOX.
+
+A FAITHFUL PORT of ags2-shell's append_model, and the details are the whole
+substance of it:
+
+  A linked SECTION is not a row -- it is a separATOR and then its contents.
+  That is where a tray menu's dividing rules come from, and skipping it (as an
+  earlier version did) loses the line before Edit/Quit.
+
+  A linked SUBMENU becomes a button that POPS OUT into its own popover on the
+  right.  Rendering it inline is wrong: the application chose a submenu, and
+  inline expansion also makes the parent menu jump about.
+
+  BUDGET is shared across the whole recursion, so a runaway model cannot build
+  unbounded widgets; ANCESTORS catches a model that links to itself."
+  (if (or (> depth 16) (memq model ancestors) (<= budget 0))
+      box
+      (let ((ancestors (cons model ancestors))
+            (n (catch #t (lambda () (get-n-items model)) (lambda args 0))))
+        (let loop ((i 0) (budget budget))
+          (if (or (>= i n) (<= budget 0))
+              box
+              (let ((section (catch #t (lambda () (get-item-link model i "section"))
+                                    (lambda args #f))))
+                (cond
+                 (section
+                  ;; A separator, but only between sections -- a leading rule at
+                  ;; the top of the menu is not what the application drew.
+                  (when (gtk-widget-get-last-child box)
+                    (append box (make <gtk-separator> #:orientation 'horizontal)))
+                  (append-model! box section group close! ancestors
+                                 (- budget 1) (+ depth 1))
+                  (loop (+ i 1) (- budget 1)))
+                 (else
+                  (let ((label (menu-attribute model i "label"))
+                        (sub (menu-item-submenu model i)))
+                    (cond
+                     (sub
+                      (when label
+                        (append box (menu-submenu-button
+                                     label sub group close! ancestors
+                                     (- budget 1) depth))))
+                     (label
+                      (append box (menu-action-button model i label group close!))))
+                    (loop (+ i 1) (- budget 1)))))))))))
+
+(define (menu-action-button model index label group close!)
+  "A button for a labelled menu item: ticked if checked, dimmed if disabled.
+
+  SENSITIVE, not just clickable.  ags2-shell sets sensitivity from
+  get_action_enabled, and without it a row the application has DISABLED --
+  \"Show internal errors\" with no errors to show, on this machine -- renders as
+  though it were available.  A greyed row is information; an apparently-enabled
+  one that does nothing is a bug report.
+
+  The tick comes from the action's STATE matching the item's target, which is
+  how a radio menu shows which option is current."
+  (let* ((action (menu-attribute model index "action"))
+         (name (action-name action))
+         (target (menu-target model index))
+         (known (and group name (has-action group name)))
+         (enabled (and known (catch #t (lambda () (get-action-enabled group name))
+                                    (lambda args #t))))
+         (checked (action-checked? group name target))
+         (inner (make <gtk-box> #:orientation 'horizontal))
          (button (make <gtk-button> #:has-frame #f)))
     (gtk-widget-add-css-class button "model-item")
+    (when known (set-sensitive button (and enabled #t)))
+    ;; The tick, before the label, as ags2-shell places it.
+    (when checked
+      (let ((check (make <gtk-image> #:icon-name "object-select-symbolic"
+                                      #:valign 'center)))
+        (gtk-widget-add-css-class check "check")
+        (append inner check)))
     (append inner (make <gtk-label> #:label label #:xalign 0
-                                     #:hexpand #t
-                                     #:use-underline #t))
+                                   #:halign 'start #:hexpand #t
+                                   #:use-underline #t))
     (set-child button inner)
     (connect button 'clicked
              (lambda (b)
-               (let ((name (action-name action)))
-                 (cond
-                  ((or (not group) (not name) (string-null? name))
-                   ;; A label with no action is a legitimate menu row (a header,
-                   ;; or an item an application chose not to wire up).
-                   #f)
-                  ((not (has-action group name))
-                   (format (current-error-port)
-                           "scheme-toolkit: tray: no action ~s on the item's group~%"
-                           name))
-                  (else
-                   (catch #t
-                     (lambda () (activate-action group name #f))
-                     (lambda (key . args)
-                       (format (current-error-port)
-                               "scheme-toolkit: tray: action ~a failed: ~a ~s~%"
-                               name key args))))))
-               (when close! (close!))))
+               (cond
+                ((not known)
+                 ;; A label with no action is legitimate (a header, or something
+                 ;; the application chose not to wire up).
+                 #f)
+                ((not enabled) #f)
+                (else
+                 (catch #t
+                   (lambda () (activate-action group name target))
+                   (lambda (key . args)
+                     (format (current-error-port)
+                             "scheme-toolkit: tray: action ~a failed: ~a ~s~%"
+                             name key args))))))
+               (when close! (close!)))
     button))
 
-(define (menu-submenu-button label sub-box)
-  "A button that reveals SUB-BOX in place.
+(define (menu-submenu-button label submodel group close! ancestors budget depth)
+  "A button for a submenu, popping SUBMODEL out to the right.
 
-Revealed rather than popped up in a second window: a nested popover inside a
-popover is a well-known source of focus bugs in GTK, and ags2-shell's animated
-popover exists mostly to work around that."
+POPS OUT, does not expand inline.  The application chose a submenu; inline
+expansion changes the parent menu's height as you browse it, and it cannot
+express a submenu that is itself a section of sections."
   (let* ((inner (make <gtk-box> #:orientation 'horizontal))
+         (popover (make <gtk-popover>))
          (button (make <gtk-button> #:has-frame #f)))
     (gtk-widget-add-css-class button "model-item")
     (gtk-widget-add-css-class button "submenu")
     (append inner (make <gtk-label> #:label label #:xalign 0
-                                     #:hexpand #t #:use-underline #t))
+                                   #:halign 'start #:hexpand #t
+                                   #:use-underline #t))
     (append inner (make <gtk-image> #:icon-name "go-next-symbolic"
-                                     #:valign 'center))
+                                   #:valign 'center))
     (set-child button inner)
-    ;; The submenu lives inside a Revealer under the button, so the popover
-    ;; grows rather than spawning a window.
-    (let ((holder (make <gtk-box> #:orientation 'vertical)))
-      (append holder button)
-      (append holder sub-box)
-      (connect button 'clicked
-               (lambda (b)
-                 (set-visible sub-box (not (slot-ref sub-box 'visible)))))
-      holder)))
+    (slot-set! popover 'has-arrow #f)
+    (slot-set! popover 'position 'right)
+    (catch #t (lambda () (set-parent popover button)) (lambda args #f))
+    (let ((box (make <gtk-box> #:orientation 'vertical)))
+      (gtk-widget-add-css-class box "tray-menu")
+      (append-model! box submodel group
+                     (lambda () (popdown popover) (when close! (close!)))
+                     ancestors budget (+ depth 1))
+      (set-child popover box))
+    (connect button 'clicked
+             (lambda (b)
+               (catch #t (lambda () (popup popover)) (lambda args #f))))
+    button))
 
-(define (make-item-popover item)
-  "A Gtk.Popover holding ITEM's menu, built by hand, or #f.
-
-NOT a Gtk.PopoverMenu: see the note above -- PopoverMenu renders a DBusMenuModel
-as an empty popup, which is the \"the menu is empty\" bug this replaces."
-  (let ((section (item-menu-model item))
-        (group (item-attr item 'action-group)))
-    (and section
-         (let* ((popover (make <gtk-popover>))
-                (box (build-menu-box section group
-                                     (lambda () (popdown popover)))))
-           (and box
-                (begin (set-child popover box) popover))))))
+(define* (build-menu-box model group close! #:optional (depth 0))
+  "A Gtk.Box of rows for MODEL, or #f when there is nothing to show."
+  (if (not model)
+      #f
+      (let* ((model (menu-unwrap model))
+             (box (make <gtk-box> #:orientation 'vertical)))
+        ;; The class ags2-shell puts on a menu box, and what its stylesheet
+        ;; targets: `window#bar popover contents .tray-menu { min-width: ... }'
+        ;; plus the padding rules for `button.model-item' and `separator'.
+        (gtk-widget-add-css-class box "tray-menu")
+        (append-model! box model group close! '() %menu-budget depth)
+        box)))
 
 (define* (tray-menu-button item #:optional (class "tray-item") (icon-size 16))
   "A button for ITEM: its icon, opening ITEM's application menu on click.
