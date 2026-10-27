@@ -617,3 +617,31 @@ the labels sit at `button > box > label`. A test asserting on the *model* would
 have passed throughout all four bugs above, because the model was always
 correct. `tray-item-menu-labels` therefore builds the same box the popover gets
 and reports what a user would SEE.
+
+## OPEN: a GTK setter used as a value returns ZERO values
+
+`Gtk` setters are void C methods, so through G-Golf they return **zero values**.
+Using one where a value is expected raises
+
+    Zero values returned to single-valued continuation
+
+for the *enclosing* form, which names no widget, no property and no line.  Three
+of these were hit in `(scheme-toolkit tray)`:
+
+    (when known (set-sensitive button #t))       ; raises
+    (when box (set-child popover box))           ; raises
+    (when tt (set-tooltip-text button tt))       ; raises
+
+    (when known (set-sensitive button #t) #t)    ; sequenced -- fine
+
+A call in STATEMENT position is fine, because the value is discarded.  Only a
+value-requiring context (`when`, `if`, `not`, `and`, `or`, a `let` binding) is a
+problem -- which is why `(gtk-widget-add-css-class w "x")` on its own line never
+bit anyone.
+
+**The tell is that the error carries no location.**  If a message says
+"Zero values returned to single-valued continuation" and names nothing, look for
+a `set-*`/`add-*`/`append` GTK call in a conditional.
+
+The same shape as `gtk-window-set-interactive-debugging` elsewhere in this file:
+a void C call reached from Scheme where a value is expected.
