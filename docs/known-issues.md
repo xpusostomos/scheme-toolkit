@@ -444,3 +444,68 @@ If the noise is unwanted it can be silenced with
 `(default-duplicate-binding-handler '(merge-generics replace last))` -- dropping
 `warn-override-core` -- but that removes the index, and the warning has already
 earned its place twice.
+
+## The warning wall, triaged: which ones to ignore and which not to
+
+Startup prints a dozen `overrides core binding` warnings.  They are NOT all the
+same thing, and "ignore them" is only right for most.  Measured:
+
+| warning | verdict |
+|---|---|
+| `map`, `for-each`, `member`, `max`, `append`, `assoc`, `read`, `unsetenv` | **benign.** Merged, not replaced -- see the section below. Verified: `(map 1+ '(1 2 3))` => `(2 3 4)`, `(for-each ...)` over a list works, `(read port)` still parses, `(assoc ...)` still works |
+| `connect`, `quit`, `present`, `show`, `hide`, `start`, `stop` | **benign but worth knowing**: these become generics carrying BOTH the Guile/GOOPS method and the GI ones. This is why the toolkit exports `run-shell`/`quit-shell` rather than `start`/`quit` |
+| `` `monitor-file' imported from both (scheme-toolkit gi) and (scheme-toolkit file) `` | **NOT benign -- a real collision**, see below |
+
+### The `monitor-file` collision, and why it is order-dependent
+
+`(scheme-toolkit file)` exports a wrapper `monitor-file` taking `(path proc)`.
+Importing Gtk ALSO brings Gio's `GFile.monitor_file` under the same name, and
+afterwards the generic has ONLY Gio's methods:
+
+    (generic-function-methods monitor-file)
+    ;; => ((<g-file> <top> <boolean>) (<g-file> <top> <g-cancellable>))
+
+Calling it the way `file.scm` documents then fails:
+
+    (monitor-file "/tmp/x" (lambda (kind path) ...))
+    ;; No applicable method for #<<generic> monitor-file (2)> ...
+
+**`(scheme-toolkit config)` survives this by IMPORT ORDER** -- it lists
+`(scheme-toolkit gi)` before `(scheme-toolkit file)`, so `file`'s binding wins
+and live config reload works. That is luck, not design: reverse the two lines
+and the config stops reloading with an error that names a generic and an arity
+rather than the collision.
+
+**The fix for a caller that hits it** is to qualify the import:
+
+    #:use-module ((scheme-toolkit file) #:prefix file:)
+    (file:monitor-file path proc)
+
+or to reference the module directly. `file.scm` already does exactly this for
+Gio's side (it imports Gio's into a private `(scheme-toolkit file gio)` module),
+so the two can coexist in one module -- but only if the caller asks for one of
+them by a qualified name.
+
+**Not yet changed.** `config.scm` works today and changing its import to a
+prefix would be a real fix rather than a cosmetic one; it is recorded here so
+the next reader does not rediscover it as a mystery.
+
+### Why "merged, not replaced" is the whole story for the benign ones
+
+`gi.scm` installs, before `(use-modules (g-golf))`:
+
+    (default-duplicate-binding-handler
+      '(merge-generics replace warn-override-core warn last))
+
+With `merge-generics`, two same-named generics are merged into ONE carrying both
+sets of methods.  That is why `map` still maps over lists after Gtk is imported.
+With `replace` instead, `map` would become a one-method generic accepting only a
+`<gtk-widget>`, and every `(map f list)` in the tree would break -- so the
+handler is load-bearing, not decoration.
+
+**Conclusion: the warning wall is safe to ignore in general, with two caveats.**
+It is also the index of which names G-Golf takes, which is the trap that
+motivated prefixing the toolkit's own exports (`st-peek`, `run-shell`,
+`<st-accessor>`); and a `from both` line -- as opposed to an `overrides core
+binding` line -- is worth reading, because that is a genuine name collision
+rather than a merge.
