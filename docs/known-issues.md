@@ -122,6 +122,63 @@ importing it — it worked only because another module's import reached the same
 module graph. `define-gi-imports` per module is the rule; the same grep catches
 it.
 
+## Three element-runtime bugs that only existed behind an earlier crash
+
+`tests/element.scm` reported 19 passes and no failures for a long time. It was
+actually **aborting** partway: `#:css` raised (a symbol where GTK wants a
+numeric priority), so the last three test groups never ran. Fixing the raise
+turned three failures on at once. The lesson is in the last section.
+
+**1. `%deferred-props` held SYMBOLS, not classes.**
+
+```scheme
+(define %deferred-props
+  '((<gtk-stack> . ("visible-child-name"))))   ; the symbol <gtk-stack>
+```
+
+A quoted `<gtk-stack>` is a symbol; `(class-of obj)` is a class OBJECT, so
+`assoc-ref`/`assq-ref` never matched and `deferred-prop?` answered `#f` for
+everything. Deferred properties were never deferred — `GtkStack`'s
+`visible-child-name` went straight to `make`, was overwritten by the first
+child added, and the stack showed page one plus
+
+    Gtk-WARNING: Child name 'second' not found in GtkStack
+
+The reason this survived review is cosmetic: a symbol and a class print
+identically. The table is now a backquote with the classes unquoted.
+
+**2. `<fragment>`'s `items` slot had no `#:init-keyword`.**
+
+```scheme
+(items #:init-form '() #:accessor fragment-items)   ; before
+```
+
+`(make <fragment> #:items items)` therefore **silently ignored** the keyword —
+GOOPS accepts an unknown init keyword on a class and drops it — so every
+fragment was empty and `(element <gtk-box> f)` added nothing. `#:init-value`
+plus `#:init-keyword #:items` fixes it.
+
+**3. A fragment's append observer updated a dead local.**
+
+`element` collected children into a local `added` and copied it into
+`%children` once, at the end. The observer runs later, so its `cons` grew a
+list nobody would read again: the widget really was appended to the box, but
+`%element-children` kept answering the old count. The local now publishes on
+every change.
+
+**The general lesson, which cost the most time here.** A test file that aborts
+reports *no failure* for everything after the abort point — the same green as
+success. Only the missing `test-end` line distinguishes them, and nobody reads
+the tail of a passing run. Two defences, both cheap:
+
+- check that the suite's own summary line appears (`test-end` prints
+  `# of expected passes`), and treat its absence as a failure;
+- make the runner count expected tests, so a group that silently stopped
+  running changes the count.
+
+The three bugs above were found in under an hour *once the tests actually
+ran*; they had been sitting behind that one raise for days.
+
 ## `guile -e main -s FILE` passes main one argument
 
 `(define (main) ...)` is the natural thing to write in an entry-point file and

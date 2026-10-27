@@ -30,6 +30,10 @@
 (define-module (scheme-toolkit widget)
   #:use-module (scheme-toolkit gi)
   #:use-module (scheme-toolkit reactive)
+  ;; Prefixed: (scheme-toolkit style) also exports apply-css!, and this module
+  ;; keeps its own name for the #:css prop.  The prefixed import is the whole
+  ;; of style.scm's surface used here, which is one call.
+  #:use-module ((scheme-toolkit style) #:prefix style:)
   #:use-module (oop goops)
   #:use-module (ice-9 match)
   #:duplicates (merge-generics replace warn-override-core warn last)
@@ -119,13 +123,37 @@ on-changed:key -> changed::key."
 ;; visible-child-name is the canonical case: set it during construction and it
 ;; is immediately overwritten by the first child added.  Gnim calls these
 ;; initProps; this is that table.
+;; The keys are CLASS OBJECTS, so the table is built with a backquote and
+;; unquotes.  Written as a plain quote it holds the SYMBOLS <gtk-stack> and
+;; <adw-toggle-group>, which match no class -- so deferred-prop? answered #f for
+;; everything and nothing was ever deferred.  It looked right because a symbol
+;; and a class print the same way.
+;; Adw.ToggleGroup's active/active-name belong here too, but only once a module
+;; imports it: the entry must be the class OBJECT, and naming an unimported
+;; class in the backquote is a load-time error rather than a silent miss.  Add
+;; the entry in the module that imports Adw, or extend this one's imports.
 (define %deferred-props
-  '((<gtk-stack> . ("visible-child-name"))
-    (<adw-toggle-group> . ("active" "active-name"))))
+  `((,<gtk-stack> . ("visible-child-name"))))
 
 (define (deferred-prop? class prop)
-  (let ((names (assoc-ref %deferred-props class)))
-    (and names (member prop names) #t)))
+  "Is PROP a property of CLASS that must wait until the children exist?
+
+The lookup is `eq?' on the class OBJECT, not assoc-ref.  assoc-ref compares with
+equal?, and a GOOPS class is not equal? to itself by value -- it is only eq? --
+so assoc-ref answered #f for every class.  The effect was that deferred
+properties were never deferred: Gtk.Stack's visible-child-name went straight to
+`make' at construction, was overwritten by the first child added, and left the
+stack showing page one with a \"Child name not found\" warning."
+  (let ((names (cond ((assq-ref %deferred-props class))
+                     (else #f))))
+    (or (and names (member prop names) #t)
+        ;; A subclass inherits the deferral: (class-of obj) for anything
+        ;; deriving from Gtk.Stack is not eq? to <gtk-stack>, and a conflict
+        ;; window or an Astal box around a stack wants the same behaviour.
+        (let loop ((rest %deferred-props))
+          (cond ((null? rest) #f)
+                ((and (is-a? class (caar rest)) (member prop (cdar rest))) #t)
+                (else (loop (cdr rest))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Child insertion
@@ -135,6 +163,7 @@ on-changed:key -> changed::key."
 ;; is that every container the shell uses has one.  When one is missing the
 ;; error names both classes, which is the signal to add a method here.
 (define-generic add-child!)
+(define-generic %remove-child!)
 (define-generic remove-child!)
 
 (define (widget? o) (is-a? o <gtk-widget>))
@@ -204,15 +233,15 @@ on-changed:key -> changed::key."
 
 ;; Removal mirrors insertion, so a For that removes a child does the same thing
 ;; for every container.
-(define-method (remove-child! (p <gtk-widget>) (c <gtk-event-controller>) type)
+(define-method (%remove-child! (p <gtk-widget>) (c <gtk-event-controller>) type)
   (remove-controller p c))
 
-(define-method (remove-child! (p <gtk-center-box>) (c <gtk-widget>) type)
+(define-method (%remove-child! (p <gtk-center-box>) (c <gtk-widget>) type)
   (cond ((eq? (slot-ref p 'start-widget) c) (set-start-widget p #f))
         ((eq? (slot-ref p 'end-widget) c) (set-end-widget p #f))
         ((eq? (slot-ref p 'center-widget) c) (set-center-widget p #f))))
 
-(define-method (remove-child! (p <gtk-overlay>) (c <gtk-widget>) type)
+(define-method (%remove-child! (p <gtk-overlay>) (c <gtk-widget>) type)
   ;; GTK4 gives no way to enumerate an Overlay's children -- there is no
   ;; get_overlay_widgets -- so the only testable case is whether C is the main
   ;; child, which get-child answers.  An overlay added with add-overlay is
@@ -223,21 +252,21 @@ on-changed:key -> changed::key."
          (set-child p #f))
         (else #f)))
 
-(define-method (remove-child! (p <gtk-box>) (c <gtk-widget>) type)
+(define-method (%remove-child! (p <gtk-box>) (c <gtk-widget>) type)
   (remove p c))
 
-(define-method (remove-child! (p <gtk-list-box>) (c <gtk-widget>) type)
+(define-method (%remove-child! (p <gtk-list-box>) (c <gtk-widget>) type)
   (remove p c))
 
-(define-method (remove-child! (p <gtk-flow-box>) (c <gtk-widget>) type)
+(define-method (%remove-child! (p <gtk-flow-box>) (c <gtk-widget>) type)
   (remove p c))
 
-(define-method (remove-child! (p <gtk-grid>) (c <gtk-widget>) type)
+(define-method (%remove-child! (p <gtk-grid>) (c <gtk-widget>) type)
   (remove p c))
 
 ;; The generic fallback for a Bin-like parent: clear the child, but only if it
 ;; really is the current one, so removing a stale child does not blank the tree.
-(define-method (remove-child! (p <gtk-widget>) (c <gtk-widget>) type)
+(define-method (%remove-child! (p <gtk-widget>) (c <gtk-widget>) type)
   (cond ((and (class-has-property? (class-of p) 'child)
               (eq? (slot-ref p 'child) c))
          (set-child p #f))
@@ -247,6 +276,20 @@ on-changed:key -> changed::key."
          (error "remove-child!: no method for this parent/child pair"
                 (class-name (class-of p)) (class-name (class-of c))))))
 
+;; The public generic: remove, then keep %children honest.
+;;
+;; Without the second half, a direct remove-child! took the widget off the
+;; parent but left it in %element-children.  The tree and the record then
+;; disagreed, so a For reconciling by walking the record would try to remove a
+;; child that was already gone -- and a test would read the wrong count.
+(define (remove-child! p c . rest)
+  (apply %remove-child! p c rest)
+  (when (and (is-a? p <gtk-widget>)
+             (hash-table? %children)
+             (hashq-ref %children p))
+    (hashq-set! %children p (delq c (hashq-ref %children p))))
+  #t)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Fragments
 ;;; ---------------------------------------------------------------------------
@@ -254,10 +297,15 @@ on-changed:key -> changed::key."
 ;; A For or a With hands the parent a single child that stands for a list of
 ;; children, and mutates that list later.  A Fragment is that stand-in: it holds
 ;; the items and a list of observers the parent registers to hear about changes.
+;; #:init-value rather than #:init-form for items, and a #:init-keyword to go
+;; with it.  Without the keyword, (make <fragment> #:items items) SILENTLY
+;; IGNORES the keyword -- GOOPS accepts unknown init keywords for a class and
+;; drops them -- so every fragment was empty and (element <gtk-box> f) added
+;; nothing.  A #f #:child-type and zero children was the only symptom.
 (define-class <fragment> ()
-  (items     #:init-form '() #:accessor fragment-items)
-  (observers #:init-form '() #:accessor fragment-observers)
-  (parent    #:init-form #f #:init-keyword #:parent #:init-value #f))
+  (items     #:init-value '() #:init-keyword #:items #:accessor fragment-items)
+  (observers #:init-value '() #:accessor fragment-observers)
+  (parent    #:init-value #f #:init-keyword #:parent))
 
 (define (fragment? x) (is-a? x <fragment>))
 (define (make-fragment items) (make <fragment> #:items items))
@@ -294,15 +342,20 @@ on-changed:key -> changed::key."
 
 (define (apply-css! widget css)
   "A per-widget provider at USER priority.  A declaration without braces is
-wrapped in a universal rule so `#:css \"color: red\"' works."
+wrapped in a universal rule so `#:css \"color: red\"' works.
+
+Delegates to (scheme-toolkit style), which HOLDS the provider.  A per-widget
+provider nobody references is collected and its rules then stop applying --
+silently, and at some unpredictable later moment -- so the one thing this must
+not do is make its own provider and drop it.  It also must not pass a symbol
+where GTK wants a number: 'user is not a priority, and the failure is a
+bytevector type error naming neither CSS nor priorities."
   (unless (is-a? widget <gtk-widget>)
     (error "apply-css!: not a widget" widget))
   (let ((css (if (and (string-contains css "{") (string-contains css "}"))
                  css
                  (string-append "* { " css " }"))))
-    (let ((provider (make <gtk-css-provider>)))
-      (load-from-string provider css)
-      (add-provider (get-style-context widget) provider 'user))))
+    (style:apply-css! widget css #:priority 800)))
 
 (define (apply-class! widget class)
   (set-css-classes widget
@@ -449,9 +502,23 @@ bindings (a property whose value is an accessor), or one of the specials #:class
             ;; built for a string child: (element <gtk-box> "hi") really does
             ;; add a widget, and a caller walking the tree should see it.
             (let ((added '()))
+              ;; record!/unrecord! publish IMMEDIATELY rather than leaving the
+              ;; final (hashq-set! ...) to do it.  A fragment's observer runs
+              ;; later, after this let has returned, so a version of this that
+              ;; only consed onto `added' updated a dead local and the parent's
+              ;; child list never grew: append added the widget to the box but
+              ;; %element-children still answered the old count.
+              (define (publish!)
+                (hashq-set! %children obj (reverse added)))
+              (define (record! child)
+                (set! added (cons child added))
+                (publish!))
+              (define (unrecord! child)
+                (set! added (delq child added))
+                (publish!))
               (define (add! child type)
                 (add-child! obj child type)
-                (set! added (cons child added)))
+                (record! child))
               (for-each
                (lambda (child)
                  (cond
@@ -470,13 +537,13 @@ bindings (a property whose value is an accessor), or one of the specials #:class
                         ((remove) (catch #t
                                     (lambda () (remove-child! obj item (child-type item)))
                                     (lambda args #f))
-                                  (set! added (delq item added)))))))
+                                  (unrecord! item))))))
                   ;; A controller is not a child widget; it is not recorded.
                   ((is-a? child <gtk-event-controller>)
                    (add-child! obj child #f))
                   (else (add! child (child-type child)))))
                children)
-              (hashq-set! %children obj (reverse! added)))
+              (publish!))
             ;; Deferred properties, set after the children exist.
             (for-each
              (lambda (pair)

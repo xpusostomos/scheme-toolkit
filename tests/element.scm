@@ -16,6 +16,8 @@
 (use-modules (scheme-toolkit gi))
 (use-modules (scheme-toolkit reactive))
 (use-modules (scheme-toolkit widget))
+;; Only for %css-providers, to assert the per-widget provider is held.
+(use-modules ((scheme-toolkit style) #:prefix style:))
 (use-modules (oop goops))
 (use-modules (srfi srfi-64))
 
@@ -106,8 +108,15 @@
   (let ((l (element <gtk-label> #:label "x" #:class "a b")))
     (test-equal "class split into two" 2
       (length (slot-ref l 'css-classes))))
-  ;; A declaration with no braces is wrapped, so this must not raise.
-  (element <gtk-label> #:label "y" #:css "color: red"))
+  ;; A declaration with no braces is wrapped, so this must not raise -- and it
+  ;; did raise, with a bytevector type error, because the priority was passed as
+  ;; the symbol 'user where GTK wants a number.  Assert the provider is HELD,
+  ;; too: a per-widget provider nobody references is collected and its rules
+  ;; then stop applying, silently and later.
+  (let ((before (length style:%css-providers)))
+    (element <gtk-label> #:label "y" #:css "color: red")
+    (test-assert "a #:css prop loads and its provider is kept"
+      (> (length style:%css-providers) before))))
 
 (test-group "deferred properties"
   ;; Gtk.Stack's visible-child-name is meaningless before the children exist:
@@ -122,12 +131,17 @@
       "second" (slot-ref s 'visible-child-name))))
 
 (test-group "fragments"
-  (let* ((f (fragment (make <gtk-label> #:label "a")))
+  ;; Keep the items by name rather than reaching into the fragment with
+  ;; fragment-items: the accessor is internal, and a test that aborts on an
+  ;; unbound name reports NO failure for every group after it -- which is
+  ;; exactly how three bugs hid here for days.
+  (let* ((a (make <gtk-label> #:label "a"))
+         (f (fragment a))
          (b (element <gtk-box> f)))
     (test-equal "contents added" 1 (length (%element-children b)))
     (fragment-append! f (make <gtk-label> #:label "b"))
     (test-equal "append reached the parent" 2 (length (%element-children b)))
-    (fragment-remove! f (car (fragment-items f)))
+    (fragment-remove! f a)
     (test-equal "remove reached the parent" 1 (length (%element-children b)))))
 
 (test-group "this! on an existing object"
