@@ -509,3 +509,61 @@ motivated prefixing the toolkit's own exports (`st-peek`, `run-shell`,
 `<st-accessor>`); and a `from both` line -- as opposed to an `overrides core
 binding` line -- is worth reading, because that is a genuine name collision
 rather than a merge.
+
+## A stylesheet attached to a widget styles ONLY that widget (GTK4)
+
+**The most expensive trap in this project so far, and it looks like nothing at
+all.** A shell applies its stylesheet to each window:
+
+    (add-provider (get-style-context window) provider 800)
+
+The stylesheet parses with zero errors. `parsing-error` never fires. The
+provider is held and referenced. `shell-css` returns the exact text intended.
+And **nothing changes**, because in GTK4 that call styles the widget it is given
+and is NOT inherited by its children:
+
+    gtk_style_context_add_provider               styles THAT WIDGET only
+    gtk_style_context_add_provider_for_display   styles every widget under it
+
+GTK3 inherited a widget-attached provider, which is why the wrong call is the
+natural one to write and why every tutorial-shaped instinct points at it. On a
+toplevel the visible effect is that the window's own background changes and
+every button, label and image inside keeps the theme's styling -- so a bar looks
+*almost* styled, and the parts that are wrong look like CSS specificity bugs.
+
+It cost an afternoon of chasing the wrong hypothesis. The symptoms all pointed
+at the CSS because the CSS was the only thing being examined:
+
+    tray icons had a rounded box      -> Adwaita's button background, untouched,
+                                          because `all: unset' never reached them
+    hover was a squircle              -> same, `box-shadow: none' never applied
+    a garish probe colour changed
+      nothing at all                  -> the probe never reached the widget either
+
+**The fix is one call, and the trap is its NAME.** `add_provider_for_display` is
+a namespace FUNCTION, and G-Golf names those after the full C identifier with
+the prefix kept:
+
+    (defined? 'add-provider-for-display)                      ; => #f
+    (defined? 'gtk-style-context-add-provider-for-display)     ; => #t
+
+while METHODS get the short name (`add-provider`). So looking for the name you
+expect finds nothing, and the obvious conclusion -- the one drawn here at first
+-- is that G-Golf skipped it for being deprecated. It did not skip it; it is
+present under its long name. This is the same quirk as
+`gtk-window-set-interactive-debugging` recorded above, and the general rule is
+worth stating once:
+
+> A G-Golf binding may be named after the full C identifier with its prefix
+> intact, even when a neighbouring method of the same class gets the short name.
+> Before concluding that a function is unavailable, check for the prefixed
+> spelling.
+
+`(scheme-toolkit style)` now provides `apply-provider-for-display!`, and
+`apply-provider!` says plainly that it styles one widget -- which is exactly
+what the per-widget `#:css` prop wants.
+
+**How to check which of the two you have**, without a screenshot: add a rule with
+an unmistakable colour to a class on a DESCENDANT and read it back.
+
+    (gtk-widget-get-color child)   ; (1.0 0.0 0.0 1.0) if the rule reached it
