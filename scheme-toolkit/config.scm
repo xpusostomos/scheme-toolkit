@@ -516,9 +516,20 @@ be missing it."
    (widget-config-widgets)))
 
 (define* (write-config-lines datum #:optional (port (current-output-port)))
-  "Write DATUM, a config list, ONE TOP-LEVEL ENTRY PER LINE -- each widget's name
-and its options on a line of its own -- so the file can be read, and a change to
-one widget is a change to one line in a diff.
+  "Write DATUM, a config list, a line at a time:
+
+  ((root
+    (widgets ((scheme-desktop widgets bar <bar-desktop-widget>) ...)))
+   ((scheme-desktop widgets bar <bar-desktop-widget>)
+    (position top)
+    (height 30))
+   ((scheme-desktop widgets dock <dock-desktop-widget>)
+    (mode static)))
+
+ONE WIDGET PER LINE, and each of that widget's options on a line of its own --
+so the file can be read, and a change to one option is a change to one line of a
+diff.  An option's VALUE is left as it stands, however long: what a person edits
+is the list of options, and splitting the values too would hide it.
 
 STILL ONE DATUM: the same list `read' gives back, only laid out.  Anything that
 is not a list is written as it is."
@@ -528,10 +539,29 @@ is not a list is written as it is."
         (let loop ((rest datum) (first #t))
           (unless (null? rest)
             (unless first (display "\n " port))
-            (write (car rest) port)
+            (write-config-entry (car rest) port)
             (loop (cdr rest) #f)))
         (display ")\n" port))
       (begin (write datum port) (newline port))))
+
+(define (write-config-entry entry port)
+  "One top-level entry: the name, then each of its options on a line of its own,
+one level in -- aligned under the name it belongs to."
+  (if (and (pair? entry) (list? (cdr entry)) (pair? (cdr entry)))
+      (begin
+        ;; THE ENTRY'S OWN PARENS, and the first version left them out: the name
+        ;; was written bare, so `((name) (option))' came out as `(name) (option)'
+        ;; -- still readable, and a DIFFERENT list.  Caught by writing the config
+        ;; and reading it back to see whether it was the same datum.
+        (display "(" port)
+        (write (car entry) port)
+        (for-each (lambda (option)
+                    (newline port)
+                    (display "  " port)
+                    (write option port))
+                  (cdr entry))
+        (display ")" port))
+      (write entry port)))
 
 (define (write-widget-config!)
   "Write the file atomically: a temporary file, then a rename.
@@ -550,7 +580,7 @@ read as corrupt and moved aside."
                 (display ";; allowed, values are typed, and this file is rewritten\n")
                 (display ";; when the shell changes an option.\n")
                 (display ";;\n")
-                (display ";; One line per widget: its name, then its options.\n")
+                (display ";; One line per widget, each of its options on a line under it.\n")
                 (write-config-lines (widget-config-datum)))))
            (catch #t
              (lambda () (rename-file tmp path) #t)
