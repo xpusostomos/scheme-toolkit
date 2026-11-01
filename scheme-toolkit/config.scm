@@ -90,6 +90,9 @@
             widget-config-save! widget-config-save-pending? schedule-widget-save!
             load-widget-config!
             watch-widget-config! widget-config-live? widget-config-datum
+            ;; For a change made to a config LIST rather than to one option at a
+            ;; time -- enabling a plugin, whose widgets splice themselves in.
+            apply-widget-config-datum!
             widget-config-set! widget-config-value widget-config-ref
             widget-config-reset!))
 
@@ -504,8 +507,11 @@ be missing it."
                                (let ((name (widget-option-name spec)))
                                  (and name (list name (slot-ref w name)))))
                              (widget-config-slots w))))
+       ;; KEYED BY THE WIDGET'S QUALIFIED NAME -- `(module ... <class>)', or
+       ;; `root' for the root -- which is the name the root's list and the bar's
+       ;; layout use, so one widget has one name in the whole file.
        (and (pair? opts)
-            (cons (string->symbol (widget-name w)) opts))))
+            (cons (widget-name w) opts))))
    (widget-config-widgets)))
 
 (define (write-widget-config!)
@@ -759,57 +765,12 @@ the class is the whole of declaring it."
 
 ;;; --- the flat format, and how it is read -----------------------------------
 ;;
-;; A ONE-OFF SHIM, DELETEABLE ONCE EVERY USER'S FILE HAS BEEN REWRITTEN.
-;;
-;; The file used to be a flat alist of the shell's schema -- `(ui-scale . 1.4)'
-;; -- and it is now one entry per widget. A user upgrading has the old shape on
-;; disk, and the alternative to reading it is silently resetting their settings:
-;; their scale and their bar margin would go back to the defaults with nothing
-;; said. So the old names are mapped to the options that replaced them, once,
-;; and the next save writes the new shape.
-;;
-;; WHICH FORMAT AN ENTRY IS comes from the registry, not from the shape: a car
-;; that names a registered widget is the new format, anything else is an old
-;; option name. `widgets' is the case that makes shape-sniffing impossible --
-;; as a flat pair and as a nested entry it READS identically.
-
-(define %legacy-options
-  '((bar-position        . (bar position))
-    (bar-height          . (bar height))
-    (bar-margin          . (bar margin))
-    (bar-opacity         . (bar opacity))
-    (widgets             . (bar layout))
-    (ui-scale            . (theme scale))
-    (workspace-count     . (workspaces count))
-    (date-format         . (datemenu date-format))
-    (datemenu-position   . (datemenu-panel datemenu-position))
-    (network-position    . (network-panel network-position))
-    (clock-format        . (clock format))))
-
-;; Options that were in the old file and now mean nothing: their features have
-;; not been built, so there is no widget to own them.  Listed rather than
-;; warned about, because a warning on every start for an option nobody can act
-;; on is noise, and noise is how a real warning gets ignored.
-(define %legacy-dropped
-  '(show-seconds? notification-timeout osd-enabled?))
-
-(define (apply-legacy-option! name value)
-  "One option from a file in the format this shell used to write.
-
-Returns #t when it was applied, #f when the name means nothing now -- an option
-for a feature that was dropped, which is not worth a warning on every start."
-  (let ((where (assq-ref %legacy-options name)))
-    (and where
-         (let ((w (desktop-widget-named (car where))))
-           (and w
-                (let ((spec (widget-config-slot-spec w (cadr where))))
-                  (and spec (apply-widget-option! w spec value))))))))
-
 (define (apply-widget-config-entry! entry)
-  "One top-level entry of the config file, new format or old."
+  "One top-level entry of the config file: a widget's name and its options."
   (let ((name (and (pair? entry) (car entry))))
     (cond
-     ((not (symbol? name))
+     ;; A NAME IS A QUALIFIED NAME -- a list -- or `root'.
+     ((not (or (symbol? name) (pair? name)))
       (log-warning "a config entry does not start with a name" (widget-config-file)))
      ;; THE NEW FORMAT: the name is a widget.
      ((desktop-widget-named name)
@@ -827,10 +788,6 @@ for a feature that was dropped, which is not worth a warning on every start."
                  (log-warning (format #f "~a has no option ~a; ignored" name oname)
                               (widget-config-file)))))
          (if (list? (cdr entry)) (cdr entry) '()))))
-     ;; THE OLD FORMAT, or a widget this shell no longer has.
-     ((memq name %legacy-dropped) #t)
-     ((assq-ref %legacy-options name)
-      (apply-legacy-option! name (cdr entry)))
      (else
       (log-warning (format #f "no widget called ~a; its options are ignored" name)
                    (widget-config-file))))))

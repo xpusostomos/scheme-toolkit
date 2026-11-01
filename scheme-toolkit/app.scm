@@ -59,7 +59,8 @@
             unregister-desktop-widgets! unregister-desktop-widget!
             ;; the root: the one widget that owns which widgets are live
             <root-desktop-widget> root-widgets root-widgets-set! root-sync! root-start!
-            widget-class-module! widget-class-module widget-class-named
+            widget-class-named widget-short-name
+            widget-qualified-name widget-qualified-name-set!
             widget-name-from-class-name
             monitors for-each-monitor monitor-name monitor-geometry
             on-monitors-changed
@@ -1175,7 +1176,9 @@ THE DEFAULT CLICK IS THE TWO ABOVE, IN ORDER -- anchor, then toggle -- so a pane
 opened by a click is placed under the button that opened it without the panel
 knowing the button exists.  A caller that passes its own `on-clicked' replaces
 both, and gets a button that neither places nor toggles; nothing does that today."
-  (let* ((name (widget-name widget))
+  ;; THE SHORT NAME, because this one is presentation: the button's GTK name and
+  ;; its CSS class.  See `widget-short-name'.
+  (let* ((name (widget-short-name widget))
          (window-name (widget-window-name widget))
          (btn (apply element <gtk-button>
                      #:name name
@@ -1297,7 +1300,19 @@ both, and gets a button that neither places nor toggles; nothing does that today
 
 ;; THE ROOT OF THE HIERARCHY, and the one place `#:metaclass' is written: every
 ;; widget class below inherits it, so no subclass repeats it.
-(define-class <desktop-widget> () #:metaclass <widget-class>)
+(define-class <desktop-widget> ()
+  ;; WHO THIS WIDGET IS: its QUALIFIED NAME, `(module ... <class>)' -- the
+  ;; module that defines its class, then the class.  Set by the root when it
+  ;; makes the widget from a name in its list, and it is what the registry, the
+  ;; config file and the bar's layout all call it.  Two plugins can each have a
+  ;; `<clock-desktop-widget>'; they cannot both have it in the same module.
+  ;;
+  ;; #f for a widget made by hand rather than from a name, which `widget-name'
+  ;; then derives from the class -- see there.
+  (qualified-name #:init-value #f #:init-keyword #:qualified-name
+                  #:accessor widget-qualified-name
+                  #:setter widget-qualified-name-set!)
+  #:metaclass <widget-class>)
 
 ;; obj -> ((slot-name . (accessor . setter)) ...)
 ;;
@@ -1605,7 +1620,22 @@ the whole arrangement is that setting a value does its one thing straight away."
         (substring s 0 (- (string-length s) (string-length suffix)))
         s)))
 
+;; THE IDENTITY IS THE QUALIFIED NAME; THE SHORT NAME IS PRESENTATION.
+;;
+;; `widget-name' answers the qualified name, `(scheme-desktop widgets network
+;; <network-panel-desktop-widget>)' -- the key in the registry, the config file
+;; and the bar's layout, and unique across plugins.
+;;
+;; `widget-short-name' answers "network-panel", derived from the class as names
+;; always were, and it is for what the SCREEN sees: a window's name, a GTK widget
+;; name, a CSS class.  The stylesheet says `window#network' and
+;; `button.network-panel', and none of that had any reason to change when the
+;; identity did.
 (define-method (widget-name (w <desktop-widget>))
+  (or (widget-qualified-name w) (widget-short-name w)))
+
+(define (widget-short-name w)
+  "W's presentation name: \"network-panel\" for <network-panel-desktop-widget>."
   (widget-name-from-class-name (class-name (class-of w))))
 
 ;; WHICH PART OF THE BAR THIS ITEM IS IN -- `left', `center' or `right' -- and it
@@ -1674,7 +1704,7 @@ the whole arrangement is that setting a value does its one thing straight away."
 ;; The default is the widget's own name, which is right for every widget whose
 ;; window is named after it -- and a widget with no windows still answers, so
 ;; `panel-button' can name a button after a widget that is only ever in a bar.
-(define-method (widget-window-name (w <desktop-widget>)) (widget-name w))
+(define-method (widget-window-name (w <desktop-widget>)) (widget-short-name w))
 
 (define-generic widget-window)
 (define-method (widget-window (w <window-widget>)) #f)
@@ -1886,14 +1916,20 @@ of calls with no results."
   (map car %desktop-widgets))
 
 (define (desktop-widget-named name)
-  "The widget called NAME, or #f.
+  "The live widget NAME denotes, or #f.
 
-NAME may be a symbol or a string: the registry is keyed by the string
-`widget-name' returns, and a caller writing a name in Scheme would rather type a
-symbol."
-  (let ((pair (assoc (if (symbol? name) (symbol->string name) name)
-                     %desktop-widgets)))
-    (and pair (cdr pair))))
+NAME is any of:
+
+  a QUALIFIED NAME   '(scheme-desktop widgets network <network-panel-desktop-widget>)
+                     -- what the registry is keyed by, and what a module that does
+                     not import the class writes
+  a CLASS            <network-panel-desktop-widget> -- what the module that
+                     DEFINES the class writes, with nothing to spell out
+  'root              the root, which has no class of its own to name"
+  (if (is-a? name <class>)
+      (find (lambda (w) (eq? (class-of w) name)) (map cdr %desktop-widgets))
+      (let ((pair (assoc name %desktop-widgets)))
+        (and pair (cdr pair)))))
 
 (define (desktop-widget-required name)
   "The widget called NAME, or an error that says which one was missing.
@@ -1921,7 +1957,9 @@ The single-name form, because the root has to be able to take a widget OUT when
 a user's list stops naming it.  `unregister-desktop-widgets!' -- every one of
 them -- is not that operation, and using it would throw away the widgets the
 user DID ask for."
-  (let* ((key (if (symbol? name) (symbol->string name) name))
+  ;; THE KEY AS GIVEN: a qualified name, or 'root.  It used to be turned into a
+  ;; string, back when the registry was keyed by short-name strings.
+  (let* ((key name)
          (before (length %desktop-widgets)))
     (set! %desktop-widgets
           (filter (lambda (pair) (not (equal? (car pair) key))) %desktop-widgets))
@@ -1953,44 +1991,32 @@ user DID ask for."
 ;; instances are what a user CHOOSES, and those are made, unmade and remade on
 ;; demand.
 
-;; Which module a name is looked up in.  A shell says once, because the toolkit
-;; cannot know where a shell's widget classes live and should not guess: the
-;; name-to-class rule is mechanical, the module is a decision.
-(define %widget-class-module (make-parameter #f))
-
-(define (widget-class-module! module)
-  "Say which module `widget-class-named' looks a class up in.
-
-MODULE is a module or its name.  A shell calls this once, naming the module that
-imports its widget classes -- the one place every `<foo-desktop-widget>' is
-visible."
-  (%widget-class-module
-   (if (symbol? module) (resolve-module module #:ensure #t) module)))
-
-(define (widget-class-module)
-  "The module `widget-class-named' looks in, or #f."
-  (%widget-class-module))
-
+;; FROM A QUALIFIED NAME TO A CLASS, by loading the module the name gives.
+;;
+;; There used to be ONE module a shell named, which had to import every widget
+;; class so they could be looked up there -- which is what a plugin cannot do: it
+;; is not imported by anything.  A qualified name says where its class is, so
+;; there is nothing to set up and nothing a plugin has to register with.
 (define (widget-class-named name)
-  "The class NAME denotes: `clock' or `<clock-desktop-widget>'.
+  "The class NAME denotes.  NAME is a qualified name,
+'(scheme-desktop widgets network <network-panel-desktop-widget>), or a class.
 
-BOTH FORMS, because the mapping is mechanical in both directions and already
-exists: `widget-name' derives \"clock\" from `<clock-desktop-widget>', so a name
-that arrives in either shape is understood.  That is what lets a config file
-list whatever the user finds natural without a second naming convention.
+THE MODULE IS LOADED IF IT IS NOT ALREADY -- `resolve-interface' does that, from
+the load path, which is how a plugin's widgets come to exist.
 
-A name with no class raises and says which name, because the alternative -- a
-widget that silently is not there -- is the bug this whole section is about."
-  (let* ((s (symbol->string name))
-         (class-name (if (and (> (string-length s) 2)
-                              (string-prefix? "<" s) (string-suffix? ">" s))
-                         name
-                         (string->symbol (string-append "<" s "-desktop-widget>"))))
-         (module (widget-class-module)))
-    (or (and module (catch #t (lambda () (module-ref module class-name)) (lambda args #f)))
-        (error "no widget class called" class-name
-               (if module "in" "and no widget class module was set;")
-               (if module (module-name module) "")))))
+A name with no class RAISES and says which name and why, because the alternative
+-- a widget that silently is not there -- is the bug this whole section is about."
+  (cond
+   ((is-a? name <class>) name)
+   ((and (list? name) (>= (length name) 2) (symbol? (last name)))
+    (let* ((module-name (drop-right name 1))
+           (iface (catch #t
+                    (lambda () (resolve-interface module-name))
+                    (lambda (key . args)
+                      (error "no module for widget" name key args)))))
+      (or (catch #t (lambda () (module-ref iface (last name))) (lambda args #f))
+          (error "the module does not export the widget class" module-name (last name)))))
+   (else (error "not a qualified widget name -- (module ... <class>)" name))))
 
 (define-class <root-desktop-widget> (<desktop-widget>)
   ;; THE LIST, and it is an ordinary config option like any other: it appears in
@@ -2011,7 +2037,9 @@ widget that silently is not there -- is the bug this whole section is about."
 ;; ROLE -- there is one root, the config file says `(root (widgets ...))', and a
 ;; name a user writes in a file must not depend on what a shell called its
 ;; subclass.
-(define-method (widget-name (w <root-desktop-widget>)) "root")
+;; The root is `root': it is the shell's entry point rather than a widget anyone
+;; installs, and a config path starts from it -- '(() root widgets ()).
+(define-method (widget-name (w <root-desktop-widget>)) 'root)
 
 (define-method (root-sync! (r <root-desktop-widget>))
   "Make the registry equal what R lists: create what is missing, drop the rest.
@@ -2033,9 +2061,22 @@ A widget being dropped is DISPOSED FIRST -- its windows destroyed -- because a
 widget that is no longer live must not leave a window behind.  Dropping the
 registry entry alone would be the quiet kind of leak: the widget stays on screen
 and nothing can reach it."
-  (let* ((names (root-widgets r))
-         (classes (map widget-class-named names))
-         (want (map (lambda (c) (widget-name-from-class-name (class-name c))) classes)))
+  ;; THE NAMES ARE QUALIFIED, and each is resolved to its class by loading its
+  ;; module.  A NAME THAT CANNOT BE RESOLVED -- a plugin that was removed, a
+  ;; module with an error in it -- COSTS THAT WIDGET, NOT THE SHELL: it is
+  ;; reported and left out, and every other widget is still made.  One broken
+  ;; plugin taking the bar down with it would make installing plugins a gamble.
+  (let* ((resolved (filter-map
+                    (lambda (name)
+                      (catch #t
+                        (lambda () (cons name (widget-class-named name)))
+                        (lambda (key . args)
+                          (format (current-error-port)
+                                  "scheme-toolkit: cannot load widget ~s: ~a ~s~%"
+                                  name key args)
+                          #f)))
+                    (root-widgets r)))
+         (want (map car resolved)))
     ;; OUT first, so a name that moved is created fresh rather than mistaken for
     ;; one that is already there.
     (for-each (lambda (n)
@@ -2045,13 +2086,14 @@ and nothing can reach it."
                       (catch #t (lambda () (widget-destroy-windows! w)) (lambda args #f))
                       (unregister-desktop-widget! n)))))
               (desktop-widget-names))
-    ;; IN, one instance per name -- the class list is walked in step with the
-    ;; names so nothing is constructed twice.
-    (for-each (lambda (c)
-                (let ((n (widget-name-from-class-name (class-name c))))
-                  (unless (desktop-widget-named n)
-                    (register-desktop-widget! (make c)))))
-              classes)
+    ;; IN, one instance per name, given its qualified name BEFORE it is registered
+    ;; -- the registry keys it by that name.
+    (for-each (lambda (pair)
+                (unless (desktop-widget-named (car pair))
+                  (let ((w (make (cdr pair))))
+                    (widget-qualified-name-set! w (car pair))
+                    (register-desktop-widget! w))))
+              resolved)
     (desktop-widget-names)))
 
 ;;; ---------------------------------------------------------------------------
