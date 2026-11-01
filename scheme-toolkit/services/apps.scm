@@ -17,7 +17,8 @@
   #:use-module (oop goops)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-13)
-  #:export (apps-catalog app-for-window app-icon-name))
+  #:export (apps-catalog app-for-window app-icon-name
+            app-entry app-name apps-named app-launch! same-app?))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The catalogue
@@ -155,3 +156,69 @@ and is a keyword so a caller matching many windows reads the catalogue once."
         (titles (filter-map normalise (list title initial-title))))
     (or (and (pair? classes) (by-class apps classes))
         (and (pair? titles) (by-title apps titles)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Naming an application, and starting one
+;;; ---------------------------------------------------------------------------
+
+(define (app-entry app)
+  "APP's desktop entry -- `firefox.desktop' -- or #f.  What a list of pinned
+applications names an app by, because it is the one name that is unique."
+  (prop app 'entry))
+
+(define (app-name app)
+  "APP's name as a person reads it -- `Firefox' -- or #f."
+  (prop app 'name))
+
+(define (same-app? a b)
+  "Whether A and B are the same application: the same desktop entry."
+  (and a b (let ((ea (app-entry a)) (eb (app-entry b)))
+             (and ea eb (string-ci=? ea eb)))))
+
+(define* (apps-named names #:key (apps (apps-catalog)))
+  "The applications NAMES denote, in their order, each once.
+
+ags2-shell's favourites lookup (`#set_favorites'): a name is tried as a desktop
+entry (`firefox.desktop'), then as one without its `.desktop' (`firefox'), then
+as an application's name (`Firefox'), all ignoring case.  A name that matches
+nothing is dropped rather than failing the list -- an uninstalled app in a list
+of pinned ones is ordinary.  A second name for an app already found is dropped
+too, so pinning `firefox' and `firefox.desktop' gives one icon."
+  (let* ((by (lambda (key-of)
+               (lambda (key)
+                 (find (lambda (app)
+                         (let ((k (key-of app)))
+                           (and k (string-ci=? k key))))
+                       apps))))
+         (by-entry (by app-entry))
+         (by-short (by (lambda (app)
+                         (let ((e (app-entry app)))
+                           (and e (if (string-suffix-ci? ".desktop" e)
+                                      (string-drop-right e 8)
+                                      e))))))
+         (by-name (by app-name))
+         (strip (lambda (n) (if (string-suffix-ci? ".desktop" n) (string-drop-right n 8) n)))
+         (found (filter-map (lambda (n)
+                              (and (string? n)
+                                   (or (by-entry n) (by-short n) (by-name n)
+                                       (by-name (strip n)))))
+                            names)))
+    ;; THE FIRST of two names for one app is the one whose position counts.
+    (reverse (fold (lambda (app acc)
+                     (if (any (lambda (a) (same-app? a app)) acc) acc (cons app acc)))
+                   '()
+                   found))))
+
+(define (app-launch! app)
+  "Start APP, the way its desktop file says.  #t when it was started.
+
+AstalApps' own `launch', rather than running the Exec line: an Exec line has
+field codes (%U, %f) that have to be removed first, and `launch' does that."
+  (let ((launch (gi-name 'launch)))
+    (and launch
+         (catch #t
+           (lambda () (launch app) #t)
+           (lambda (key . args)
+             (format (current-error-port) "scheme-toolkit: cannot launch ~a: ~a ~s~%"
+                     (or (app-name app) "?") key args)
+             #f)))))
