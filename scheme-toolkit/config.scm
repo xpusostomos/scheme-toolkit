@@ -93,6 +93,7 @@
             ;; For a change made to a config LIST rather than to one option at a
             ;; time -- enabling a plugin, whose widgets splice themselves in.
             apply-widget-config-datum!
+            write-config-lines
             widget-config-set! widget-config-value widget-config-ref
             widget-config-reset!))
 
@@ -514,6 +515,24 @@ be missing it."
             (cons (widget-name w) opts))))
    (widget-config-widgets)))
 
+(define* (write-config-lines datum #:optional (port (current-output-port)))
+  "Write DATUM, a config list, ONE TOP-LEVEL ENTRY PER LINE -- each widget's name
+and its options on a line of its own -- so the file can be read, and a change to
+one widget is a change to one line in a diff.
+
+STILL ONE DATUM: the same list `read' gives back, only laid out.  Anything that
+is not a list is written as it is."
+  (if (and (list? datum) (pair? datum))
+      (begin
+        (display "(" port)
+        (let loop ((rest datum) (first #t))
+          (unless (null? rest)
+            (unless first (display "\n " port))
+            (write (car rest) port)
+            (loop (cdr rest) #f)))
+        (display ")\n" port))
+      (begin (write datum port) (newline port))))
+
 (define (write-widget-config!)
   "Write the file atomically: a temporary file, then a rename.
 
@@ -531,10 +550,8 @@ read as corrupt and moved aside."
                 (display ";; allowed, values are typed, and this file is rewritten\n")
                 (display ";; when the shell changes an option.\n")
                 (display ";;\n")
-                (display ";; One entry per widget, holding that widget's options:\n")
-                (display ";;   ((bar (position top) (height 30)) (clock (format \"%H:%M\")))\n")
-                (write (widget-config-datum))
-                (newline))))
+                (display ";; One line per widget: its name, then its options.\n")
+                (write-config-lines (widget-config-datum)))))
            (catch #t
              (lambda () (rename-file tmp path) #t)
              (lambda (key . rest)
