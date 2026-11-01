@@ -9,10 +9,12 @@
 # programming bugs from inside Guile, so the wrapper owns them.
 #
 #   run <dir|file> [args]   start a shell (sets up env, execs guile)
+#   gdb <dir|file> [args]   the same, under gdb, with a backtrace when it stops
 #   eval EXPR...            evaluate expressions in a running shell
 #   repl                    interactive REPL into a running shell
 #   list                    list running instances
 #   check-env               diagnose the environment
+#   check-unbound           compile every module; report names that do not exist
 #   guile ARGS...           run guile with the right env and load path
 #
 # The instance name defaults to $SCHEME_TOOLKIT_INSTANCE, then to the directory
@@ -48,6 +50,29 @@ if [ ! -e /usr/lib/libastal-4.so.4 ] && [ -e /usr/local/lib/libastal-4.so ]; the
     export GI_TYPELIB_PATH="/usr/local/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
 fi
 
+# THE MODULES INSTALLED FOR THIS USER.  Guile does NOT search
+# ~/.local/share/guile/site (measured on this machine: its %load-path is
+# /usr/share/guile/3.0, /usr/share/guile/site/3.0, /usr/share/guile/site,
+# /usr/share/guile, and nothing under $HOME), so a `make install-local' of a
+# sibling project -- scheme-utils, whose loader and watcher this shell uses --
+# lands somewhere nothing would find.  Adding it here is what makes that
+# install usable, and it is the same rule for any project that installs the
+# same way.
+#
+# Prepended, not appended: a locally installed module is the one the person
+# running the shell meant to try, and it must not lose to a packaged copy.
+local_site_guile() {
+    local d="${XDG_DATA_HOME:-$HOME/.local/share}/guile/site/$(guile -q -c '(display (effective-version))')"
+    # Trailing space: the arguments come back as one space-separated string, so
+    # a call that printed `-L PATH' with nothing after it would run into
+    # whatever the next one printed (`-L PATH-L OTHER' -- which is a directory
+    # that does not exist, and a load path that silently lacks an entry).
+    [ -d "$d" ] && printf -- '-L %s ' "$d"
+    # Never non-zero: this runs under `set -e', and "no local install" is the
+    # normal case on a machine that installed from a package, not a failure.
+    return 0
+}
+
 # libgtk4-layer-shell must be preloaded for Astal.Window to work at all.  Keep
 # any existing preload entries and prepend ours.
 LAYER_SHELL="libgtk4-layer-shell.so"
@@ -75,6 +100,9 @@ runtime_dir() {
 # module name to an empty module and reports "no code for module" as though
 # the file were malformed.
 load_args() {
+    # The locally installed modules first, so `-L' order decides it the way the
+    # comment above says.
+    local_site_guile
     printf -- '-L %s' "$TOOLKIT_ROOT"
     # Sibling subprojects in the same checkout, so a shell in scheme-desktop/
     # can import (scheme-desktop ...) and still see (scheme-toolkit ...).
@@ -84,6 +112,37 @@ load_args() {
         [ -d "$d" ] || continue
         printf -- ' -L %s' "$d"
     done
+}
+
+
+# ---------------------------------------------------------------------------
+# Filtering stderr
+# ---------------------------------------------------------------------------
+#
+# A shell's stderr is a place where a REAL warning has to be visible, so this
+# hides only patterns that are known, counted and justified one by one in
+# docs/filtered-warnings.md.  Nothing else is touched, and
+# SCHEME_TOOLKIT_UNFILTERED=1 gives the raw stream back.
+#
+# WHY IT HAS TO BE DONE HERE rather than in Scheme: the module-system warnings
+# bypass Guile's own ports.  Measured, each with identical output: three
+# different `default-duplicate-binding-handler' lists, that handler set from a
+# prelude loaded before anything compiles, per-module `#:duplicates', wrapping
+# `current-warning-port', and `fluid-set!' on that port.  Guile emits them
+# regardless, at a level Scheme cannot see -- so the filter is on the file
+# descriptor, where everything must pass.
+#
+# `exec' IS KEPT.  Bash sets the redirection up and then execs, so the process
+# still replaces the shell: same pid, same signal handling, same exit status.
+# The grep subshell is a child of that process and exits when the pipe closes.
+FILTERED_WARNINGS='imported module \(scheme-toolkit gi\) overrides core binding|imported from both \(scheme-toolkit gi\)|Json-CRITICAL'
+
+run_shell_command() {
+    if [ "${SCHEME_TOOLKIT_UNFILTERED:-0}" = "1" ]; then
+        exec "$@"
+    else
+        exec "$@" 2> >(grep -Ev "$FILTERED_WARNINGS" >&2)
+    fi
 }
 
 cmd="${1:-}"; shift || true
@@ -102,28 +161,103 @@ case "$cmd" in
         target="$(readlink -f "$target")"
         : "${SCHEME_TOOLKIT_INSTANCE:=$(basename "$(dirname "$target")")}"
         export SCHEME_TOOLKIT_INSTANCE
-        exec guile $(load_args) -e main -s "$target" "$@"
+        run_shell_command guile $(load_args) -e main -s "$target" "$@"
+        ;;
+
+    gdb)
+        # RUN THE SHELL UNDER THE DEBUGGER, with the same environment `run' gives.
+        #
+        # THE ENVIRONMENT GOES TO THE INFERIOR, NOT TO GDB.  `-ex set environment'
+        # rather than exporting the variables here: an LD_PRELOAD of
+        # libgtk4-layer-shell inside gdb itself is not wanted, and an
+        # LD_LIBRARY_PATH would decide which libgobject gdb loads.
+        #
+        # DEBUGINFOD IS SWITCHED ON because Arch does not install debug symbols
+        # locally.  Without it every frame is a bare library offset and the stack
+        # names nothing -- which is how a crash in this project stayed
+        # unexplained: the same stack read "crash in GTK's allocator, in a C
+        # signal handler" and, with symbols, turned out to be GTK walking a
+        # corrupt signal handler list while laying out a scrolled window.
+        #
+        # It runs to completion (or to the crash) and prints the backtrace, so
+        # the recipe is: start this in one terminal, drive the shell from another
+        # (`scheme-toolkit eval ...`, or just click the thing), and read the
+        # stack here.
+        [ $# -ge 1 ] || die "gdb: needs a file or directory"
+        target="$1"; shift || true
+        if [ -d "$target" ]; then
+            for cand in "$target/main.scm" "$target/shell.scm"; do
+                [ -f "$cand" ] && { target="$cand"; break; }
+            done
+        fi
+        [ -f "$target" ] || die "gdb: no such file: $target"
+        target="$(readlink -f "$target")"
+        : "${SCHEME_TOOLKIT_INSTANCE:=$(basename "$(dirname "$target")")}"
+        export SCHEME_TOOLKIT_INSTANCE
+        command -v gdb >/dev/null 2>&1 || die "gdb: gdb is not installed"
+
+        # An array, because every `-ex' takes one argument and these contain
+        # spaces: a bare `-ex set environment A B' would pass gdb only "set".
+        gargs=(-q
+               -ex 'set pagination off'
+               -ex 'set confirm off'
+               -ex 'set debuginfod enabled on'
+               # SIGPIPE IS NOT A CRASH.  A shell that logs a warning after its
+               # output pipe has gone stops here instead of at the fault, and
+               # the backtrace then shows a write inside a signal handler --
+               # which reads like a crash and is not one.  Measured: the first
+               # run of this verb stopped on "SIGPIPE, Broken pipe" while
+               # printing a Gtk-CRITICAL, nowhere near the bug being chased.
+               -ex 'handle SIGPIPE nostop noprint pass'
+               # The GTK/GLib thread churn is otherwise most of the output.
+               -ex 'set print thread-events off'
+               -ex "set environment LD_PRELOAD $LD_PRELOAD"
+               -ex "set environment SCHEME_TOOLKIT_INSTANCE $SCHEME_TOOLKIT_INSTANCE")
+        # Only when the wrapper decided they are needed -- normally it leaves
+        # them unset so GI uses the system install in /usr/lib.
+        if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            gargs+=(-ex "set environment LD_LIBRARY_PATH $LD_LIBRARY_PATH")
+        fi
+        if [ -n "${GI_TYPELIB_PATH:-}" ]; then
+            gargs+=(-ex "set environment GI_TYPELIB_PATH $GI_TYPELIB_PATH")
+        fi
+        gargs+=(-ex run
+                -ex 'echo \n===== stopped: backtrace =====\n'
+                -ex 'bt 40'
+                -ex 'echo \n===== threads =====\n'
+                -ex 'info threads'
+                --args guile $(load_args) -e main -s "$target" "$@")
+        exec gdb "${gargs[@]}"
         ;;
 
     eval)
         [ $# -ge 1 ] || die "eval: needs an expression"
-        exec guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" eval "$@"
+        run_shell_command guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" eval "$@"
         ;;
 
     repl)
-        exec guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" repl
+        run_shell_command guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" repl
         ;;
 
     list)
-        exec guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" list
+        run_shell_command guile $(load_args) -e main -s "$TOOLKIT_ROOT/tools/repl-cli.scm" list
         ;;
 
     check-env)
-        exec guile $(load_args) -s "$TOOLKIT_ROOT/tools/check-env.scm" "$@"
+        run_shell_command guile $(load_args) -s "$TOOLKIT_ROOT/tools/check-env.scm" "$@"
+        ;;
+
+    check-unbound)
+        # Compile every module and report references to names that do not exist.
+        # Run it after touching a module's imports or moving a definition about:
+        # an unbound name that a `catch' hides is a silent no-op, and one raised
+        # inside a signal handler corrupts GObject's emission list and crashes
+        # the shell later, somewhere else entirely.
+        run_shell_command guile $(load_args) -s "$TOOLKIT_ROOT/tools/check-unbound.scm" "$@"
         ;;
 
     guile)
-        exec guile $(load_args) "$@"
+        run_shell_command guile $(load_args) "$@"
         ;;
 
     ""|-h|--help|help)

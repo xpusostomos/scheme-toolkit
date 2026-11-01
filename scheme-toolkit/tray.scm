@@ -40,7 +40,8 @@
   #:use-module (scheme-toolkit gi)
   #:use-module (scheme-toolkit reactive)
   #:use-module (scheme-toolkit widget)
-  #:use-module (scheme-toolkit astal)
+  #:use-module (scheme-toolkit service-helpers)
+  #:use-module (scheme-toolkit services tray)
   #:use-module (oop goops)
   #:use-module (ice-9 format)
   #:use-module (ice-9 match)
@@ -590,8 +591,14 @@ handler, which is what this does."
     (when (item-tooltip item)
       (set-tooltip-text button (item-tooltip item))
       #t)
+    ;; `#:valign 'center' IS ABOUT THE HOVER SHAPE, not about the picture.  A
+    ;; GtkImage fills its parent's height by default, so the icon's BOX was as
+    ;; tall as the bar and its own 16 pixels sat in the middle of a tall rectangle
+    ;; -- and a circle drawn on that box is a vertical oval.  Centred, the box is
+    ;; the icon, which is a square, and a circle on it is a circle.
     (set-child button (make <gtk-image> #:gicon (item-icon item)
-                                        #:pixel-size icon-size))
+                                        #:pixel-size icon-size
+                                        #:valign 'center))
     ;; The action group must be on an ANCESTOR of the buttons that reference
     ;; its actions -- the popover's contents are built inside it below, and the
     ;; popover is parented to the button, so the button is that ancestor.
@@ -745,28 +752,47 @@ than reading it once.  A one-shot read produces a tray that never appears.
 An empty tray hides itself, so it takes no space in a bar until something
 registers."
   (let ((box (element <gtk-box> #:orientation 'horizontal #:class class)))
-    (let ((t (catch #t (lambda () (tray)) (lambda args #f))))
-      (when t
-        (let ((model (catch #t (lambda () (slot-ref t 'items-model)) (lambda args #f))))
-          (when model
-            ;; items-changed fires with (position removed added).  The
-            ;; arguments are not used: the tray is small enough to rebuild
-            ;; whole, and reading them correctly is a source of off-by-one
-            ;; bugs for no benefit at this size.
-            (connect-signal! model "items-changed"
-                     (lambda (m position removed added)
-                       (catch #t
-                         (lambda ()
-                           (update-tray! box #:class item-class
-                                              #:icon-size icon-size))
-                         (lambda (key . args)
-                           ;; Report the KEY AND the offending name.  A bare
-                           ;; "rebuild failed: unbound-variable" cost a
-                           ;; debugging round here: the name IS the message.
-                           (format (current-error-port)
-                                   "scheme-toolkit: tray: rebuild failed: ~a ~s~%"
-                                   key args)))))))))
-    (update-tray! box #:class item-class #:icon-size icon-size)
+    ;; EVERY REBUILD GETS ITS OWN REACTIVE ROOT, and the previous one is
+    ;; disposed first.
+    ;;
+    ;; This is not tidiness.  A rebuild is triggered by `items-changed', which
+    ;; is emitted by C -- and a Guile parameter is not in scope inside a C
+    ;; callback, so `(%scope)' is #f there and every `connect-signal!' the
+    ;; rebuild makes warned "on-cleanup called outside a scope; it will never
+    ;; run" and then kept its handler for the life of the process.  Eleven of
+    ;; those on a normal start, one per item per event, all leaked.
+    ;;
+    ;; `create-root' is what puts a scope back.  Disposing the previous root
+    ;; before building the next is the other half: without it the handlers of
+    ;; every superseded button would survive the rebuild that replaced them.
+    (let ((dispose-items #f))
+      (define (rebuild-items!)
+        (when dispose-items (catch #t dispose-items (lambda args #f)))
+        (set! dispose-items
+              (create-root (lambda (_dispose)
+                             (update-tray! box #:class item-class
+                                               #:icon-size icon-size)))))
+      (let ((t (catch #t (lambda () (tray)) (lambda args #f))))
+        (when t
+          (let ((model (catch #t (lambda () (slot-ref t 'items-model))
+                              (lambda args #f))))
+            (when model
+              ;; items-changed fires with (position removed added).  The
+              ;; arguments are not used: the tray is small enough to rebuild
+              ;; whole, and reading them correctly is a source of off-by-one
+              ;; bugs for no benefit at this size.
+              (connect-signal! model "items-changed"
+                       (lambda (m position removed added)
+                         (catch #t
+                           rebuild-items!
+                           (lambda (key . args)
+                             ;; Report the KEY AND the offending name.  A bare
+                             ;; "rebuild failed: unbound-variable" cost a
+                             ;; debugging round here: the name IS the message.
+                             (format (current-error-port)
+                                     "scheme-toolkit: tray: rebuild failed: ~a ~s~%"
+                                     key args)))))))))
+      (rebuild-items!))
     box))
 
 ;;; ---------------------------------------------------------------------------

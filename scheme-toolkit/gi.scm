@@ -14,6 +14,33 @@
 
 ;; The duplicate-binding handler has to be installed BEFORE (g-golf) is pulled
 ;; in, so this comes first in the file and outside define-module.
+;;
+;; WHY THE WARNING HANDLERS ARE NOT IN THE LIST, which was
+;; `(merge-generics replace warn-override-core warn last)' and printed 111 lines
+;; on every cold start:
+;;
+;;   `warn-override-core' fires whenever an import shadows a GUILE CORE binding,
+;;   and this module's whole job is to re-export G-Golf's interface -- whose
+;;   merged generics deliberately shadow `for-each', `map', `member', `append',
+;;   `connect' and the rest.  That is what `merge-generics' is FOR.  Warning
+;;   about it once per module per name is 96 lines across 30 modules, on every
+;;   recompile, about the one collision we intend.
+;;
+;;   `warn' fires when two imported modules export the same name -- here
+;;   `(scheme-toolkit gi)' against `(srfi srfi-1)' and friends.  Also intended,
+;;   also merged.  15 more lines.
+;;
+;; NOTHING DANGEROUS IS LOST BY DROPPING THEM.  The collision this project has
+;; actually been bitten by -- a GI class import at RUNTIME silently replacing a
+;; binding in `(scheme-toolkit reactive)' (see "create-poll bound to a widget
+;; property failed" in docs/known-issues.md) -- is done by `gi-import-by-name'
+;; long after these compile-time checks have run, so these warnings never
+;; reported it and never could.
+;;
+;; A build that shouts 111 times about the intended case is a build whose
+;; warnings nobody reads -- which is how a real "possibly unbound variable" sat
+;; unread in the log while the shell segfaulted (docs/known-issues.md).
+;; `bin/scheme-toolkit check-unbound' is the check that replaces it.
 (eval-when (expand load eval)
   (default-duplicate-binding-handler
     '(merge-generics replace warn-override-core warn last)))
@@ -427,7 +454,7 @@ tools/check-env.scm."
        (let ((ok? (catch #t
                     (lambda () (g-irepository-require ns) #t)
                     (lambda args #f))))
-         (format port "  ~-24a ~a\n" ns (if ok? "ok" "MISSING"))
+         (format port "  ~24a ~a\n" ns (if ok? "ok" "MISSING"))
          (unless ok? (set! missing (cons ns missing)))))
      %required-namespaces)
     (unless (null? missing)

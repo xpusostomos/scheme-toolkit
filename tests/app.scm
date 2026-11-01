@@ -44,16 +44,21 @@
       (test-equal "names are distinct" (length names)
         (length (delete-duplicates names))))))
 
-(test-group "window registry"
+(test-group "widget registry"
   ;; No application is running, so %app is #f; a window cannot be built yet.
   ;; The registry itself is what is under test.
-  (test-equal "an unknown window is #f" #f (window "nope"))
-  (test-equal "no windows to start" '() (windows)))
+  ;;
+  ;; THE VERBS NAME WIDGETS, not windows.  A window is reached through the widget
+  ;; that owns it, so `windows-named', `windows' and `toggle-window' are gone --
+  ;; these three lines went on calling them and went on failing, which is what a
+  ;; stale test does: it reports a missing feature rather than a missing name.
+  (test-equal "an unknown widget is #f" #f (desktop-widget-named "nope"))
+  (test-equal "no windows to start" '() (shell-windows)))
 
-(test-group "toggle-window on an unknown name"
-  ;; Must not throw: a keybinding that names a window this shell does not have
+(test-group "toggle-widget on an unknown name"
+  ;; Must not throw: a keybinding that names a widget this shell does not have
   ;; should log and do nothing, not take the shell down.
-  (test-assert "returns #f rather than raising" (not (toggle-window "not-a-window"))))
+  (test-assert "returns #f rather than raising" (not (toggle-widget "not-a-widget"))))
 
 (test-group "for-each-monitor keys roots by monitor"
   ;; Without an application we cannot build windows, but the root bookkeeping

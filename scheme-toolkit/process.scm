@@ -34,7 +34,7 @@
   #:use-module (ice-9 format)
   #:use-module (srfi srfi-13)
 
-  #:export (exec exec-async
+  #:export (exec exec-async exec-shell
             subprocess
             run-command
             create-subprocess))
@@ -88,6 +88,34 @@ and returns #f rather than taking the shell down."
 (define (exec command)
   "Alias for exec-async, kept because the reference shells spell it `exec'."
   (exec-async command))
+
+(define (exec-shell command)
+  "Run COMMAND as a SHELL command line, detached.
+
+`exec-async' takes an argv LIST. This takes the string a shell would take, and
+the difference is not cosmetic: everything Omarchy puts in a menu `action' is a
+shell command line, and several of them need one --
+
+  theme=$(omarchy-theme-switcher); [[ -n $theme ]] && omarchy-theme-set \"$theme\"
+
+-- so splitting one into argv would silently change what it does, and passing
+the string to `exec-async' makes `argv-strings' map over a string and fail with
+nothing more informative than "map".
+
+  (exec-shell \"notify-send hi\")"
+  ;; OUTPUT IS DISCARDED, IN THE CHILD, BY THE CHILD.
+  ;;
+  ;; `exec-async' reads the child's stdout to EOF on a thread and then closes
+  ;; the pipe -- and a command still writing when that happens is killed by
+  ;; SIGPIPE partway through. Measured: `touch x && echo done' created the file
+  ;; and then died on the echo. A menu action that prints its progress before
+  ;; doing its work would therefore stop before doing it, which is exactly the
+  ;; failure that looks like "the command did nothing".
+  ;;
+  ;; The subshell is what makes the redirection apply to the WHOLE command line
+  ;; rather than to its last word: `a && b >/dev/null' redirects only `b'.
+  (exec-async (list "bash" "-lc"
+                    (string-append "(" command ") >/dev/null 2>&1"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Streaming

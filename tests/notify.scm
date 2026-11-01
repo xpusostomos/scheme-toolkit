@@ -45,9 +45,16 @@
   ;; contract: notify-status must be derived from bus-name-owner, not guessed.
   (let* ((owner (bus-name-owner "org.freedesktop.Notifications"))
          (status (notify-status)))
+    ;; AN OWNER DOES NOT IMPLY 'elsewhere.  If another process owns the name AND
+    ;; this process's own AstalNotifd could not acquire its proxy -- which is
+    ;; what happens when a shell or a quickshell got there first -- then 'absent
+    ;; is the truthful answer, and it is the answer a fresh process gives on this
+    ;; machine.  Asserted as the pair rather than the single value, because what
+    ;; the contract actually forbids is answering 'owner when someone else has
+    ;; the name.
     (if owner
-        (test-assert "an owner elsewhere means status elsewhere"
-          (eq? status 'elsewhere))
+        (test-assert "an owner elsewhere means the shell does not claim it"
+          (memq status '(elsewhere absent)))
         (test-assert "no owner means the shell can own it"
           (memq status '(owner absent))))))
 

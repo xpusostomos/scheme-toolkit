@@ -29,6 +29,7 @@
   #:use-module (srfi srfi-13)
   #:export (css-rules->string css-rule->string
             apply-css! apply-provider! apply-provider-for-display!
+            provider-load!
             reset-css!
             css-provider-for
             css-error->string
@@ -150,6 +151,25 @@ whole appearance with it."
     ;; Held for the process's life; see %css-providers.
     (set! %css-providers (cons provider %css-providers))
     (values provider (reverse errors))))
+
+(define (provider-load! provider css)
+  "Load CSS INTO an existing PROVIDER, replacing what it had.  Returns errors.
+
+FOR A STYLESHEET THAT CHANGES WHILE THE SHELL RUNS -- a wallpaper turning the
+palette over.  `css-provider-for' makes a NEW provider, and a display provider is
+ADDED and never removed, so re-applying a changed stylesheet that way leaves TWO
+providers on the display at the same priority with the old one still winning
+somewhere: the shell recoloured some widgets and not others, which looks like a
+half-finished theme rather than like a bug in the mechanism.
+
+Loading into the provider that is already attached re-parses it and invalidates
+the widgets that read it, so there is still exactly one."
+  (let ((errors '()))
+    (catch #t
+      (lambda () (load-from-string provider css))
+      (lambda (key . rest)
+        (set! errors (cons (format #f "load failed: ~a" key) errors))))
+    (reverse errors)))
 
 (define* (apply-provider! widget provider #:key (priority 800))
   "Attach an existing PROVIDER to WIDGET's style context.  Returns #t or #f.

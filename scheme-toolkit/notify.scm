@@ -26,7 +26,8 @@
 
 (define-module (scheme-toolkit notify)
   #:use-module (scheme-toolkit gi)
-  #:use-module (scheme-toolkit astal)
+  #:use-module (scheme-toolkit service-helpers)
+  #:use-module (scheme-toolkit services notifd)
   #:use-module (scheme-toolkit reactive)
   #:use-module (oop goops)
   #:use-module (ice-9 format)

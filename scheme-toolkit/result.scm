@@ -104,12 +104,36 @@ missing binary, a bad argument)."
 (define (describe-error error)
   "A one-line rendering of whatever `catch' handed us.
 
-A caught exception arrives as (KEY . ARGS), and the useful part is usually the
-first argument -- a message string for `error', the offending value for a
-type error."
+A caught exception arrives as (KEY . ARGS), and the useful part -- a message
+string, an offending value -- is usually near the front.  Not always, and the
+loudest exception in the toolkit is Guile's own `error':
+
+  (error \"900 is not valid\")   ->   (misc-error #f \"~A\" (\"900 is not valid\") #f)
+
+THE MESSAGE IS A FORMAT STRING PLUS THE ARGUMENTS IT WANTS, which is why looking
+for a string in the first two positions finds nothing -- `(car args)' is #f and
+`(cadr args)' is the format \"~A\", not the text.  Nearly every `error' in Scheme
+has this shape, so it is recognised here rather than printed as a list: a log
+line reading
+
+  error: misc-error (#f \"~A\" (\"900 is not valid\") #f)
+
+is a log line nobody reads."
   (cond
    ((string? error) error)
    ((and (pair? error) (string? (car error))) (car error))
+   ;; Guile's `error': (KEY #f FORMAT ARGS #f).  FORMAT is at index 2 and ARGS at
+   ;; index 3 -- `error' keeps the format and its arguments apart and puts #f in
+   ;; front of them, so a lookup that starts at the front finds nothing and this
+   ;; case has to count.  Rendered through `format' so the arguments are
+   ;; substituted; if the format is one this cannot apply, the format string
+   ;; itself is still better than the whole list.
+   ((and (pair? error) (pair? (cdr error)) (pair? (cddr error))
+         (pair? (cdddr error))
+         (string? (caddr error)) (list? (cadddr error)))
+    (catch #t
+      (lambda () (apply format #f (caddr error) (cadddr error)))
+      (lambda args (caddr error))))
    ((and (pair? error) (pair? (cdr error)) (string? (cadr error))) (cadr error))
    ((pair? error) (format #f "~a ~s" (car error) (cdr error)))
    (else (format #f "~s" error))))

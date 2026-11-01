@@ -122,6 +122,118 @@ importing it — it worked only because another module's import reached the same
 module graph. `define-gi-imports` per module is the rule; the same grep catches
 it.
 
+## A double quote inside a stylesheet comment ends the string
+
+**Was.** `(scheme-desktop style)` stopped compiling:
+
+    WARNING: compilation of .../style.scm failed:
+    Syntax error:
+    source expression failed to match any pattern in form (define %network-css "\n/* ---- the wifi panel ...")
+
+— naming `%network-css`, which had not been touched.
+
+**Cause.** The block CSS in `style.scm` lives in **Scheme string literals**, and
+a comment written inside one contained `"Audio"`. The quote ended the string, so
+every line after it was read as Scheme, and the definition that happened to be
+open when the parser gave up got the blame.
+
+**The same trap as the docstring entry below** (`Unbound variable: it`), which is
+why that one is worth reading twice: inside a string, `"` is a delimiter and
+nothing else. Nothing is escaped in the CSS, so nothing warns.
+
+**How to find it.** The compiler names a definition that looks untouched — that
+is the tell. Then, for the string literal it names, print the lines that contain
+a quote and are not the opening or closing one:
+
+    python3 -c "
+    lines = open('scheme-desktop/scheme-desktop/style.scm').read().split(chr(10))
+    print([(i+1, l[:60]) for i, l in enumerate(lines[883:1621]) if chr(34) in l])"
+
+**How to apply.** In a CSS comment inside these strings, do not use double
+quotes. Backticks or nothing at all; both read fine.
+
+## RESOLVED: an unbound name raised in a signal handler corrupts GObject's emission list
+
+**Was.** `scheme-desktop`'s bluetooth panel killed the shell (SIGSEGV) every time
+it was opened, sometimes immediately, sometimes a second later. The backtrace
+named nothing in this project:
+
+    #0 emission_find (signal_id=69, instance=…)
+    #4 <emit signal 'changed' on [GtkAdjustment]>
+    #6 gtk_viewport_size_allocate
+    #8 gtk_scrolled_window_allocate_child (width=380)
+    #30 gdk_frame_clock_run_layout
+
+**Cause.** A procedure — `refresh-bluetooth-panel-later!` — was called in **six**
+places and its definition had been lost in an edit. Every call raised
+`Unbound variable`, and those calls were in signal handlers (`notify::visible` on
+the panel's window, and the panel's own click/hover handlers).
+
+**Why that is a crash and not an error.** Guile unwinds an exception by
+longjmp'ing, and it does not care that the C frames in between are GTK's. Thrown
+from inside `g_signal_emit`, it leaves a **dangling entry in GObject's
+thread-local list of in-progress emissions**. The *next* emission of any signal —
+here `GtkAdjustment::changed`, during the next layout pass — then walks that list
+and dies in `emission_find`. So:
+
+- the crash is in an **unrelated** signal, which is why no Scheme frame is on the
+  stack and why the backtrace named nothing;
+- it is unaffected by removing the panel's contents — the corruption had already
+  happened at an earlier emission;
+- it is **timing-dependent**: under valgrind's slower timing it stopped happening,
+  which is a false negative, not a fix.
+
+**It was in the logs.** Every crashing shell printed
+
+    scheme-desktop/widgets/bluetooth.scm:190:23: warning: possibly unbound
+    variable `refresh-bluetooth-panel-later!'
+
+twelve times before the crash. The rule "always check the guile warnings" would
+have found it in seconds; the crash behind the warning cost hours.
+
+**How it was found.** `bin/scheme-desktop gdb` (see below), breaking on Guile's
+exception throw and looking for `g_signal_emit` under it:
+
+    set pagination off
+    set confirm off
+    set debuginfod enabled on
+    set breakpoint pending on          # libguile loads with the program
+    break scm_ithrow
+    commands
+      silent
+      bt 18
+      continue
+    end
+    run
+
+A hit whose stack contains `g_signal_emit` **is** an error escaping a handler;
+the `lookup_bound` frames above it name it as an unbound variable. (`-batch`
+matters: without it gdb prompts about debuginfod and answers "No", and every
+frame is then a bare library offset.)
+
+**Two rules that follow.**
+
+1. **An exception must never cross a C callback boundary.** `catch` around the
+   body of anything called from C — signal handlers above all — turns this whole
+   class into a log line instead of a corrupted process.
+2. **When a GObject/GTK program segfaults with a stack that names no code of
+   yours, suspect an exception thrown from a handler**, not the signal being
+   emitted. Look for the *earlier* emission.
+
+**`bin/scheme-toolkit check-unbound`** now compiles every module from source and
+reports these names with file and line, ignoring the deliberate G-Golf overrides.
+It exits non-zero when it finds one, so it can gate a change. It found a second
+live instance the first time it ran: `tools/repl-cli.scm` used
+`call-with-new-thread` with no `(ice-9 threads)` import, so the interactive
+`scheme-toolkit repl` verb raised "Unbound variable" as soon as it started —
+untested, because the suites drive `eval`, never the interactive path. See also
+"Four bugs that a `catch` hid" above: same cause, milder symptom.
+
+**Also fixed while there:** the repl client treated a *closed* stdin (piped input,
+or Ctrl-D) as an error — `read-line` on a closed port raises rather than
+answering the eof object — and the read loop at the other end did the same with
+the socket the input thread had just closed. Both now end the session.
+
 ## Rebuilding a layer window: three things that silently produce nothing
 
 A live config change that alters the shape of the tree needs the windows
@@ -352,28 +464,58 @@ The one real problem in that area is a NAME COLLISION, not dispatch: Gio binds
 importing both makes the wrapper call itself. Gio's is imported into a private
 module and fetched from there.
 
-## OPEN: "New application windows must be added after GApplication::startup"
+## FIXED: "New application windows must be added after GApplication::startup"
 
-Two `Gtk-CRITICAL` warnings appear at shell startup. Windows still appear and
-behave, so this is cosmetic — but it is real, and it is not the ordering it
-names.
+**Status: fixed 2026-10-28. The note below was wrong about the cause, and right
+to refuse to guess.**
 
-**Ruled out by experiment.** Building a `Gtk.Window` inside the `activate`
-handler does NOT produce it, and neither does building an `Astal.Window` there:
-both minimal cases are clean. So `run-shell`'s activate-time build is not the
-cause, and moving construction to `startup` would be cargo-culting.
+The critical is NOT produced by a shell's first start, and it is not about the
+ordering of widget construction. It is produced by a **second** launch of the
+same instance, and the reason it got that far is a bug in `run-shell`:
 
-**What is left to check.** The shell builds a nested element tree (centerbox →
-three boxes → module widgets) inside the window, and `element` applies CSS and
-attaches controllers along the way. The likeliest explanation is one of those
-children reaching for something that wants an application window already
-registered — a style provider or a controller added before the toplevel is
-attached.
+    (when (catch #t (lambda () (register %app)) (lambda args #f))
+      ... "already running" ... (exit 0))
 
-**Why it is not fixed here.** It costs nothing at runtime, and guessing at a
-fix would put an untested reordering into the startup path of every shell built
-on this toolkit. Worth root-causing when M8 adds notification popups, which
-create windows on the fly and would multiply the warning.
+`register` is a GOOPS generic. It has no method for `<gtk-application>`, so the
+call raised `No applicable method for register` on every single start -- and the
+`catch` around it turned that into `#f`, which is the same value as "not
+already running". **The guard had never once fired.** A second launch therefore
+went on to build a full set of windows for an application that is not the
+primary owner; a remote instance never receives `startup`, so GTK rejected each
+window it added:
+
+    Gtk-CRITICAL: New application windows must be added after the
+    GApplication::startup signal has been emitted.
+
+**The fix** is `g-application-register`, checked for the remote case:
+
+    (let ((registered? (catch #t (lambda () (g-application-register %app #f)) ...)))
+      (unless registered? ... (exit 1))
+      (when (g-application-get-is-remote %app)
+        ... "already running" ... (exit 0)))
+A second launch now prints `scheme-desktop is already running; use
+scheme-toolkit eval to talk to it` and exits before building anything, and the
+criticals are gone.
+
+**The lesson, and it is the same one three times over on this project:** a
+`catch` that returns `#f` cannot tell "the call said no" from "the call blew
+up", and here it hid a guard that had never worked. Every `catch` added to
+silence a warning has to be re-read as a possible mask for a real error.
+
+**Two symptoms went with it.** The same duplicate-instance runs also printed
+twelve `on-cleanup called outside a scope; it will never run` warnings -- a
+shell building widgets for a GtkApplication that is not the primary owner is
+building them where the scope machinery had not been set up. Both are gone: four
+start/toggle cycles after the fix are clean.
+
+A third symptom was a hard exit:
+
+    srfi/srfi-1.scm:236:2: In procedure map:
+    In procedure map: Wrong type argument: 0
+
+**It was the tray, and it is fixed -- see the next entry.** The eleven
+`on-cleanup` warnings and this exit came from the same place, and pinning the
+first one down pinned both.
 
 ## "overrides core binding" warnings: measured, and they are benign
 
@@ -685,3 +827,607 @@ for `(ia{sv}av)` -- and it belongs in `(scheme-toolkit dbus)`, not in the tray.
 
 **Not yet done.** Recorded so the next reader does not re-derive it from a
 screenshot comparison.
+
+
+**CORRECTION (2026-10-27).** The paragraph above is WRONG and was written from a
+misdiagnosis. `Gio.DBusMenuModel` does not drop `Close` or the separator, and
+ags2-shell was never reading a different model.
+
+The bug was in this toolkit's own `item-menu-model`, which UNWRAPPED item 0 of
+the model before returning it. The model's top level is a list of SECTIONS:
+
+    raw model n_items = 2
+      0: no label, SECTION -> the eight rows (Open .. About)
+      1: no label, SECTION -> the separator and Close
+
+Returning item 0 threw away item 1 -- the separator and Close -- before any
+widget code saw it. Returning the model EXACTLY AS PUBLISHED fixes it, and the
+hand-built menu now draws 0-7 buttons, a separator, and Close, matching the
+`GetLayout` dump above node for node.
+
+The lesson worth keeping: `get-n-items` on a DBusMenuModel counts SECTIONS at
+the top level, not rows, so "the model has 8 items" was a true statement about
+the wrong level of the tree.
+
+---
+
+## AstalHyprland emits JSON-GLib CRITICALs on every monitor sync
+
+**Symptom.** Two CRITICALs per monitor, several times a second, from any process
+that so much as calls `Hyprland.get_default()`:
+
+    (guile:1283170): Json-CRITICAL **: json_node_get_int: assertion
+    'JSON_NODE_IS_VALID (node)' failed
+    (guile:1283170): Json-CRITICAL **: json_object_get_int_member: assertion
+    'node != NULL' failed
+
+**Cause, and it is upstream.** `lib/hyprland/src/monitor.vala:65-66`:
+
+    active_workspace = hyprland.get_workspace((int)obj.get_object_member("activeWorkspace").get_int_member("id"));
+    special_workspace = hyprland.get_workspace((int)obj.get_object_member("specialWorkspace").get_int_member("id"));
+
+Hyprland reports `specialWorkspace` as an EMPTY OBJECT (`{}`) on a monitor that
+has no special workspace. `get_int_member("id")` on an empty object yields a
+NULL node, and JSON-GLib warns twice for each. `sync_monitors` runs on every
+`workspacev2`, `focusedmon` and `monitoradded` event, so it is not once at
+startup.
+
+`lib/hyprland/src/client.vala:54` has the same shape for a client on a special
+workspace (`get_object_member("workspace")`).
+
+**What this toolkit does about it: nothing, deliberately.** It is not reachable
+from Scheme -- the parse happens inside AstalHyprland's own event loop, and it
+fires from merely constructing the singleton, before any of our code runs. The
+per-second repetition needs a Hyprland event to trigger it, so a still desktop
+is quiet.
+
+**The route that would remove it** is D3's `AstalWorkspace`
+(ext-workspace-v1), which the plan already calls for: workspaces come from
+`AstalWorkspace` and `AstalHyprland` is kept only for clients and dispatch --
+both of which are still JSON-parsed, so the criticals only disappear if the
+shell stops constructing `AstalHyprland` at all.
+
+**Not ours, and not fixable here.** Recorded so it is not re-diagnosed.
+
+
+---
+
+## FIXED: the tray connected its item signals with no reactive scope
+
+**Symptom.** Eleven `scheme-toolkit: on-cleanup called outside a scope; it will
+never run` warnings on an ordinary single-instance start -- sometimes zero,
+sometimes eleven, depending on how many StatusNotifier items had arrived by the
+time the handler ran. Once, a hard exit.
+
+**Found by printing the frames**, since Guile's own backtrace printer dies on
+the G-Golf frame:
+
+    ###   2 scheme-toolkit/reactive.scm 393   <- on-cleanup
+    ###   3 scheme-toolkit/widget.scm   467   <- connect-signal!
+    ###   4 scheme-toolkit/tray.scm     609   <- connect-signal! button "clicked"
+    ###   5 scheme-toolkit/tray.scm     706   <- (tray-menu-button item ...)
+    ###   6 srfi/srfi-1.scm             749   <- for-each
+    ###   7 scheme-toolkit/tray.scm     701   <- update-tray!'s for-each
+    ###   9 g-golf/hl-api/closure.scm   269   <- A C CALLBACK
+    ###  11 g-golf/hl-api/function.scm   90
+
+**Cause.** `tray-widget` rebuilds its item buttons from the `items-changed`
+signal. That signal is emitted by C, and a Guile **parameter is not in scope
+inside a C callback** -- `(%scope)' is `#f` there, whatever the shell's dynamic
+state was. So every `connect-signal!' the rebuild made warned, and then kept its
+handler for the life of the process: one leaked handler per item per event.
+
+**Fix.** Each rebuild runs inside its own `create-root', and the previous one is
+disposed first:
+
+    (let ((dispose-items #f))
+      (define (rebuild-items!)
+        (when dispose-items (dispose-items))
+        (set! dispose-items
+              (create-root (lambda (_) (update-tray! box ...)))))
+      ...)
+
+`create-root' is what puts a scope back; disposing the previous root is the
+other half, or the handlers of every superseded button survive the rebuild that
+replaced them.
+
+**The general lesson, and it applies to every widget that reacts to a C signal:
+"the code that runs later" is not the same dynamic context as "the code that was
+built".** Anything a signal handler constructs -- widgets, bindings,
+connections -- needs a root of its own, because `%scope' cannot survive a trip
+through C.
+
+**The same bug was in DESKTOP's workspaces pills**, and it was found second only
+because the tray announces itself. `widgets/bar/workspaces.scm` rebuilds its
+pills from `subscribe` on the workspace accessors, which AstalHyprland notifies
+from its `event` signal -- also emitted by C. Six pills, six warnings, every
+time the focused workspace changed. Fixed the same way: each rebuild gets a root
+and the previous one is disposed.
+
+What made it hard to see: **a shell that is merely started produces no warnings
+at all.** Both bugs need an external event -- a StatusNotifier item arriving, a
+workspace being switched -- so a start-and-screenshot test never fails. Every
+widget that rebuilds itself from a signal needs to be exercised by actually
+causing the signal.
+
+M8's notification popups, created on the fly from D-Bus, will be the next place
+this shape appears.
+
+**The exit had the same shape.** `for-each' raised `Wrong type argument: 0' on
+the tray rebuild path. Guile named the caller (`map') rather than the procedure
+that failed (`srfi-1.scm:749' is `for-each'), which is why the error read as
+something else entirely. Both symptoms stopped when the scope was restored.
+
+
+---
+
+## FIXED: "In procedure map: Wrong type argument: 0" -- a G-Golf bitfield passed as 0
+
+**Symptom.** Clicking inside the date menu killed the shell:
+
+    srfi/srfi-1.scm:236:2: In procedure map:
+    In procedure map: Wrong type argument: 0
+
+The message names `map`, which is nowhere in the failing code, and `srfi-1.scm:236`
+is `wrong-type-arg` -- so even the line number is the error *reporter*, not the
+error. Guile's backtrace printer dies at the G-Golf frame, so the stack was no
+help either.
+
+**Cause, found by bisecting the handler rather than the symptom.** The popup
+window's click-outside gesture calls
+
+    (gtk-widget-pick win x y 0)
+
+**G-Golf passes a C bitfield as a LIST of symbols, not as an integer.** `0` is
+not "no flags" to it; it is a non-list, and G-Golf walks the flag list to build
+the C value with a `map`. `'()` is "no flags" and works.
+
+    (gtk-widget-pick w 995.0 173.0 0)     ; => Wrong type argument: 0
+    (gtk-widget-pick w 995.0 173.0 '())    ; => #<gtk-image>
+
+A bare symbol fails the same way (`(non-targetable)` is a list, but G-Golf
+wanted it wrapped) -- only a list is accepted.
+
+**The reliable repro was clicking the calendar's month arrows**, because the
+gesture is on the POPUP and therefore fires for any click inside it. That is
+also why it looked like a calendar bug.
+
+**Rule for this toolkit: every `GtkPickFlags`, `Gtk*Flags` and bitfield parameter
+is a LIST.** Passing an integer for one produces a `map` error that names neither
+the call nor the file.
+
+**How it was finally pinned.** No mouse-synthesis tool exists on this machine
+(`ydotool`/`dotool` are absent, `wtype` is keyboard-only), so the gesture was
+driven directly: `popup-window` temporarily stashed its gesture controller and
+window in module variables, and `(emit g "pressed" 1 x y)` reproduced the crash
+exactly. The coordinates came from `gtk-widget-compute-bounds` on the arrow
+button. Worth repeating -- for a widget that only misbehaves on a click, emitting
+the signal is faster and more precise than any amount of reading.
+
+---
+
+## A dock must not take a positive exclusive zone, or every top bar shortens
+
+**Symptom.** A bar anchored `top left right` starts 55px in from the left edge
+instead of at it, and stops short of the right, on a screen where nothing else
+is wrong. Measured on this machine while `ags2-shell` was also running:
+
+    eDP-1 (1920 wide):  reserved=[55, 114, 0, 0]      # [left, top, right, bottom]
+    our bar:            xywh: 55 81 1865 33
+
+The 55 is `ags2-shell`'s dock: `xywh: 0 48 55 1032`, a left strip with an
+exclusive zone.
+
+**It is not a bug in the bar, and there is no bar setting that fixes it.** The
+layer-shell protocol has ONE knob, `exclusive_zone`, and it means different
+things per value -- there is no way to say "reserve my strip *and* ignore
+everybody else's":
+
+    > If set to zero, the surface indicates that it would like to be moved to
+    > avoid occluding surfaces with a positive exclusive zone.  If set to -1,
+    > the surface indicates that it would not like to be moved to accommodate
+    > for other surfaces, and the compositor should extend it all the way to the
+    > edges it is anchored to.
+
+So a surface that reserves its strip is, by the same declaration, asking to be
+moved to avoid other reserved strips. Every combination was measured:
+
+| setting | x | y | width | reserves | verdict |
+|---|---|---|---|---|---|
+| `exclusive`, anchor `top left right` | 55 | 81 | 1865 | 33 | inset, correct otherwise |
+| `ignore` (zone -1) | 0 | **0** | 1920 | 0 | full width, but ALSO stops avoiding -- lands on top of the other bars |
+| `exclusive`, anchor `top` alone + explicit width | **28** | 81 | 1920 | 33 | Hyprland centres on the *usable* area (1865), so a 1920 surface hangs off the right |
+| `ignore` + `margin-top 81` | 0 | 81 | 1920 | 0 | full width and stacked -- but reserves nothing, so **maximised windows slide under the bar**. Reported as a worse failure than the inset, and reverted |
+
+**The fix belongs in the DOCK, and it is one word.** Astal maps `Exclusivity` to
+`exclusive_zone` directly (`lib/astal/gtk4/src/widget/window.vala`):
+
+    case Exclusivity.NORMAL:     set_exclusive_zone(this, 0);        // avoid others, reserve nothing
+    case Exclusivity.EXCLUSIVE:  auto_exclusive_zone_enable(this);   // reserve the surface's extent
+    case Exclusivity.IGNORE:     set_exclusive_zone(this, -1);       // neither
+
+Quickshell -- which is *not* affected on the same desktop -- does exactly this
+in its own source, with the reasoning in a comment:
+
+    // DockWindow.qml -- the dock
+    // Kept clear of the bar's reserved edge, without reserving one of its own:
+    // floating windows go where they are put.
+    exclusionMode: ExclusionMode.Normal
+    exclusiveZone: 0
+
+    // Bar.qml -- the bar
+    exclusionMode: ExclusionMode.Normal
+    exclusiveZone: thickness
+
+The dock reserves nothing, so no edge is shortened and the bar spans the screen
+as an ordinary top bar. Quickshell's bar is not doing anything special; its dock
+is.
+
+**`ags2-shell` does the opposite** (`widget/Dock/index.tsx:200`):
+
+    exclusivity={createComputed(() => active() && is_static() ? EXCLUSIVE : IGNORE)}
+
+In static mode its dock reserves a left strip, and its own top bar -- anchored
+`left right`, so asking to avoid zones -- dutifully shortens itself by its own
+dock. Changing that one `EXCLUSIVE` to `NORMAL` aligns it with Quickshell.
+
+**The rule for this toolkit, and the reason this entry exists:** a `<layer-window>`
+used as a **dock** must be `#:exclusivity 'normal` (zone 0), never `'exclusive`.
+`'exclusive` on a dock looks correct in isolation -- a static dock that pushes
+windows aside is a reasonable thing to want -- and it silently shortens every top
+bar on the machine, including one built by the same shell. That is exactly
+`ags2-shell`'s bug, and it is the obvious thing to type.
+
+**No change needed in the bar.** It is already `'exclusive`, which is right for
+a bar, and it will span `0 0 <width>` with no code change the moment nothing
+holds a left zone -- which is the case as soon as `ags2-shell` is not running.
+
+## G-Golf generates some methods with NO specializers, and they cannot be called
+
+`AccessPoint.get_connections` is the third instance of the same G-Golf failure,
+and it is worth naming because the symptom does not look like the cause.
+
+Astal's `Network.AccessPoint.get_connections` returns
+`GenericArray<NM.RemoteConnection>` -- the list of saved connection profiles
+that match this access point, i.e. "have I joined this before". It is the right
+way to ask, and Astal asks it that way itself (`ap.filter_connections(wifi.
+device.client.connections)`).
+
+Under G-Golf 0.8.7 it is unusable, and not in a way that says so:
+
+    n methods 1
+      specializers ()
+    (get-connections ap)          -> ERROR: goops-error
+    (get-connections nm-client)   -> ERROR: goops-error
+
+The method is generated with an **empty specializer list**. A method with no
+specializers takes no arguments, so every call with a receiver is "no
+applicable method" -- which reads as *you passed the wrong object*, and sends
+you looking for a different object to pass. There is no object that works.
+
+`AstalWorkspace` was the first instance and `NM.Client.connections` (a
+`GPtrArray`) behaves the same way. **The pattern is a container return type G-Golf
+cannot turn into a receiver: `GenericArray<T>`, `GPtrArray`.** A `GList` return
+is fine -- `get_workspaces` and `get_monitors` come back as Scheme lists.
+
+**How to tell this apart from a genuine wrong-argument error**, which is the
+thing that wastes the time: ask for the specializers, not the error.
+
+    (map (lambda (m) (map class-name (method-specializers m)))
+         (generic-function-methods (module-ref (current-module) 'get-connections)))
+    => (())
+
+An empty list is the G-Golf codegen failure. A non-empty list naming classes you
+did not pass is an ordinary arity/type mistake.
+
+**Workaround, in `(scheme-toolkit astal)`:** `known-wifi-ssids` reads the saved
+profiles from `nmcli -t -f NAME,TYPE connection show` and `access-point-known?`
+matches against that list. It costs one local subprocess, which is why the
+predicate takes an optional pre-fetched list and why the caller fetches once per
+refresh rather than once per access point.
+
+## Module-level state is process state: the rule for anything a reload touches
+
+**Written down because the failure is silent.** A reload calls whatever it is
+told to and assumes the world it left is the world it finds. Module-level state
+breaks that assumption -- and it breaks it quietly: a stale cache looks exactly
+like a working one, and the symptom appears somewhere else entirely.
+
+Hyprscheme hit this at scale (`~/GIT/Hyprscheme/CLAUDE.md`): its host throws the
+whole Scheme side away and re-evaluates the config into a fresh generation, so
+every module with state defines an unexported `reset`, and a sweep in `init.scm`
+calls them all before the config is read. **We do not need that sweep, and the
+reason is worth stating: our config is data, not code.** We re-read a file and
+rebuild widget trees; modules load once and are never re-evaluated. Most of what
+Hyprscheme must reset, we never invalidate.
+
+That is a property to keep, not one to rely on by accident. **The rule:**
+
+> A module-level binding is PROCESS-lifetime unless its module exports a
+> `reset!` that the reload calls. If you add state that a rebuild invalidates,
+> you must add the `reset!` in the same commit.
+
+And for anything created at runtime, ask which of these it is and say so in a
+comment:
+
+| created with | belongs to | on reload |
+|---|---|---|
+| `create-poll` / `interval` / `timeout` | the process, memoised | **keep** -- re-creating leaks a subprocess per rebuild |
+| `monitor-file` | the process, one per path | **keep** -- `monitor-file` shares the monitor and appends a callback, so re-watching appends a second one that fires for ever |
+| `create-root` / `create-window-root` | a scope | **dispose and rebuild** -- the reload's job |
+| `get_default()` singletons (Astal) | the process | **keep** -- clearing drops the backend |
+| persisted user data (frecency) | the process AND disk | **keep** -- clearing loses history |
+
+**What NOT to do**, each of which has a failure that looks like something else:
+
+- **Do not memoise a resource without saying it is memoised.** `clock-poller`
+  and `date-poller` are `(unless %x (set! %x ...))` with a comment saying why.
+  Without the comment the next person "fixes" it by moving the `set!` out, and
+  every rebuild starts another `date` process per second.
+- **Do not re-monitor a path on a rebuild.** `monitor-file` adds callbacks to a
+  shared monitor and returns a stop procedure nobody keeps. A rebuild that
+  watches again leaves the old callback alive, subscribed to a dead widget.
+- **Do not reset a `get_default()` singleton.** It is not a cache; it is the
+  connection to NetworkManager/WirePlumber. Re-acquiring it on every config save
+  is a slow and visible bug.
+- **Do not put per-generation state in a module variable "for now".** It works
+  until the first reload and then it is a stale value nobody can find.
+- **Do not rely on `use-modules` re-reading anything.** It loads once per
+  PROCESS, ever. Re-evaluating a module's top level means `load` on the file, not
+  `use-modules` on the name -- and if a config ever becomes code, that distinction
+  is what makes a reload work at all.
+
+**Where this bites today, verified:** none of it does. `%clock-poll`,
+`%date-poll` and `%time-poll` are memoised and reused; every `monitor-file`
+caller is a once-at-startup path; the calendar's uptime timer is cancelled and
+recreated per menu open, not per rebuild; `%config-ticks` and `%initialising`
+are weak-keyed so dead widgets collect. The audit is the *reason* to keep it
+that way, not a description of a bug.
+
+## The config watcher: now in scheme-utils, and now all working
+
+**THE WATCHER IS NO LONGER IN THIS TREE.** `(scheme-toolkit watch)` and
+`(scheme-toolkit inotify)` were Hyprscheme's, taken whole, and they were never
+about *this* shell: reading a config and noticing that it changed is the same
+job wherever it happens. Both modules now live in the separate `scheme-utils`
+tree as `(scheme-utils watch)` and `(scheme-utils inotify)`, alongside the
+loader, and `(scheme-desktop config)` uses those. A shell now supplies only the
+two decisions that are actually its own -- what to load, and what a reload
+means -- through `auto-watch-configure!` and a waiter.
+
+The boundary that matters, and it is what made the move worth doing: the
+**waiting is a seam**. `auto-watch-waiter!` takes `(proc fd thunk)`; GLib's is
+supplied by default and a Hyprland plugin passes its own. scheme-utils does not
+own an event loop, and does not pretend to.
+
+**VERIFIED WORKING** (headless probes, `XDG_CONFIG_HOME` set on the command line,
+nothing built and nothing presented):
+
+| change | reloads |
+|---|---|
+| edit `config.scm` | +1 |
+| edit `init.scm` | +1 |
+| rewrite a file with the SAME bytes | +0 -- the content guard |
+| `init.scm` pulls a file in with `(user-load-config ...)` | +1 |
+| edit that pulled-in file | +1 |
+
+**THE NESTED CASE, WHICH USED TO BE BROKEN, NOW WORKS.** Three levels deep --
+`init.scm` loads `level1.scm`, which loads `level2.scm` -- an edit to
+`level2.scm`, a file no top-level code names, now reloads. Measured, and
+repeatedly:
+
+| change | reloads |
+|---|---|
+| edit `level2.scm`, two levels down | +1 |
+| edit `level1.scm`, one level down | +1 |
+| edit `level2.scm` again | +1 |
+
+Loaded set after the run: `config.scm`, `init.scm`, `level1.scm`, `level2.scm`.
+
+The difference is batching. The watcher collects every event in one read and
+asks the reload question **once for the batch**, adding any newly known
+directory's watch during that pass; the toolkit version armed per event, so a
+watch added by a file loaded during a reload could be added after the event
+that needed it had already been decided.
+
+**TWO THINGS THAT ARE OURS, NOT THEIRS, AND BROKE IT ON THE WAY IN:**
+
+1. **Atomic writes made one save look like three events.** `write-config-file!`
+   writes a temporary file and renames it over the target, so inotify reports
+   MOVED-TO on the target and CLOSE-WRITE and MOVED-FROM on the temporary -- and
+   each is an event against a watched *directory*. Upstream never saw it: a
+   Hyprland plugin's config is written by an editor, once. Fixed by comparing the
+   file's CONTENT, not the event, plus a 250 ms debounce.
+
+2. **Marking the file as seen on the way IN silences the watcher completely.**
+   `auto--watch-arm!` must record the new text only AFTER a reload, never on
+   arrival: marking on entry means the timer's own check finds the file matching
+   what was just recorded, and every change reads as no change. Measured -- it
+   silenced everything, and it looks correct while doing so.
+
+**HOW TO TEST THIS WITHOUT TOUCHING A REAL CONFIG.** `XDG_CONFIG_HOME` must be
+set ON THE COMMAND LINE:
+
+    XDG_CONFIG_HOME=/tmp/probe bin/scheme-toolkit guile -s probe.scm
+
+**A `setenv` from inside the script is too late and silently reads the real
+config.** `bin/scheme-toolkit` preloads the shell's modules before the script's
+first line, and `(scheme-desktop config)` computes its paths in a top-level
+`define` at load. Verified: with `setenv` the file resolved to the real
+`~/.config`; with the environment variable on the command line it resolved to the
+scratch directory. This cost several rounds of probes that were reading and
+writing the real config while believing they were sandboxed.
+
+**AND: the load hook watched far more than the config -- REMOVED.**
+
+Hyprscheme builds the watch list from Guile's `%load-hook` (`hyprscheme/watch.scm`
+line 178), and this tree inherited that faithfully. The hook is **global**: it
+fires for every file the *process* loads, whoever asked for it. Its comment
+claimed that meant "the files a CONFIG chose to read, and none of the machinery's
+own modules" -- but a file pulled in by `user-load-config` is loaded from inside a
+*loaded file*, and the shell's own modules load by name, so the claim was wrong in
+both directions at once. It also meant interposing on `%load-hook` process-wide,
+which is not this machinery's to take.
+
+Measured, and the reason it was noticed: **evaluating anything over the REPL**
+makes Guile compile it, which loads its compiler sources, which the hook reported.
+The watch list came back holding 60 files from
+`/usr/share/guile/3.0/language/tree-il/` and friends, each with a directory watch,
+none of them anything a config asked for.
+
+**The loader reports now, and nothing else does.** `auto-load` calls
+`auto--watch-note-loaded!` for each file it reads -- exactly the rule in the
+heading -- and `%load-hook` is left precisely as Guile set it. The dependency runs
+one way: `(scheme-utils load)` imports `(scheme-utils watch)`.
+
+Measured after the change, with the same REPL eval that used to produce 60 files:
+
+    ("init.scm" "config.scm")
+
+Nested loads still work, because nesting goes through `auto-load` either way:
+`init.scm` -> `level1.scm` -> `level2.scm`, editing the deepest, +1 every time.
+A file loaded by a bare `primitive-load` is *not* reported -- and that is asserted
+in `scheme-utils/tests/run-tests.scm`, because it is the difference between this
+and the hook.
+
+## `AstalWp.Endpoint.route` is the DEVICE's route, not the endpoint's
+
+**Symptom.** A row in the audio panel labelled "HDMI / DisplayPort 3 Output" had a
+tooltip saying "HDMI / DisplayPort 2 Output", and it looked like a stale tooltip, a
+row built from the wrong endpoint, or a label/card mismatch.
+
+**Cause.** None of those. AstalWp's `astal_wp_endpoint_get_route_id` delegates to
+the device (`lib/wireplumber/src/endpoint.c:110`):
+
+    return is_speaker ? astal_wp_device_get_output_route_id(dev)
+                      : astal_wp_device_get_input_route_id(dev);
+
+so `route` is the card's ACTIVE port and every sink on a card reports the same
+one. Measured here, all three Renoir/Cezanne HDMI/DisplayPort sinks answer
+"HDMI / DisplayPort 2 Output" while their own `description`s read 1, 2 and 3.
+
+**What to do.** Take the port from the endpoint's `description` (which already
+names it, and is what the row shows); there is no per-endpoint route to read.
+`(scheme-toolkit services wireplumber)` keeps `endpoint-route-label` and its
+docstring records the trap, but nothing in the shell uses it for a port.
+
+Same lesson as `mpris:length` and the mute round trip above: a property that
+exists and answers is not necessarily a property that answers *about this
+object*.
+
+## A progress readout wired to an event rather than to time
+
+**Symptom.** The now-playing block's elapsed time, total and progress bar were
+`0:00`/`0:00`/empty when the audio panel opened, and started working after a
+pause/play.
+
+**Cause.** `AstalMpris.Player.position` is fed by a poll that runs once a second
+**while playing** and not at all while paused (`lib/mpris/src/player.vala`:
+`init_position_poll` / `check_position`), and a player that has not been polled
+answers `-1`. The widget wrote its numbers when the service *told* it something
+had moved, and a paused player never tells it. The pause/play click was the
+notify that had been missing -- which is what made it look like a click bug.
+
+**Rule.** A value that moves with wall-clock time belongs on a clock, not on a
+signal. The block now reconciles itself once a second, only while the panel is
+open (`panel-open?`), with the timer cancelled through `on-cleanup` -- so a closed
+panel costs nothing. Text fields are compared before writing, because `icon-name`
+assignment reloads the icon file even when the name is unchanged.
+
+**Cost of getting it wrong is subtle, not loud.** `AstalMpris` reuses its `Player`
+object when a bus name comes back, so a player that exits and reappears can leave a
+widget showing the previous track's text against the new player's numbers -- a
+mixture no single notify can be trusted to fix.
+
+## A `widget-build` that branches on data which arrives later is permanently wrong
+
+**Symptom.** The bar had no media widget. Ever. The user reported it as "the
+config lost my media widget" and had deleted `config.scm` about five times to
+recover it — and each time the symptom came back.
+
+**Cause, and it is two bugs stacked, neither of which is the config.**
+
+1. **The item branched on the player list at BUILD time.** `widget-build` runs
+   once, when the bar is built — and AstalMpris is populated asynchronously, so at
+   that instant the list is ALWAYS empty. The build took the "nothing is playing"
+   path and returned a bare box with no children, and nothing ever re-decided.
+   *Measured:* `bar-trees` held `<gtk-box> … 0 children` for the media item while
+   `mpris-players` answered one player.
+
+   The other bar items never hit this because they read a SERVICE object, which
+   exists before its data does. This was the only one whose SHAPE depended on
+   late data. The fix is `mpris-players-model` — an accessor over the players,
+   driven by `player-added`/`player-closed` — with an effect that swaps an empty
+   box for the player tree.
+
+2. **A binding path through a GList-valued property reads `#f` for ever.**
+   `(create-binding-path m (list "players" first-player "title"))` looks like the
+   obvious port and silently yields `#f`: `Mpris.players` through `slot-ref` is a
+   raw `<foreign>` pointer, `path-step` asks it for `title` on the way past, and
+   the chain collapses. `create-binding` straight onto the PLAYER object works.
+   *Measured:* the tree had six children and a blank label; the path accessor
+   answered `#f` while the player was on the bus with a title.
+
+**And the thing that made it look like config corruption.** The bar's `layout`
+option is a saved value, and `resolve-layout!` SKIPPED a name the registry no
+longer knew — with a warning, but the layout was then written back to
+`config.scm` unchanged, for ever. The stale name here was `volume`, which `audio`
+had replaced. So the bar came up a widget short on a build whose fresh default
+was right, and deleting the file only helped until the next write.
+
+**Rule.** `prune-layout!` now TRANSLATES a renamed widget (`%renamed-widgets`)
+rather than dropping it, drops names with no successor, and SAVES — because a
+repair made during startup has no later change to carry it to the file. A renamed
+widget in a shipped default needs an entry in that table or every existing user's
+bar loses the slot.
+
+## A pending config save is lost if the shell exits within the debounce
+
+**Symptom.** A layout repaired in memory at startup was still stale in the file
+after a restart, so the repair repeated on every start.
+
+**Cause.** Saves are debounced (400 ms) and only the RELOAD path ever flushed a
+pending one. Nothing flushed on shutdown, so any change — or repair — within the
+window was discarded when the shell exited. `start-shell-config!` now connects
+`shutdown` to `widget-config-save!`, once per call.
+
+## A `create-effect` that reads no accessor runs once and never again
+
+**Symptom.** The audio panel's now-playing thumbnail kept the previous video's
+picture. The title updated, the thumbnail did not.
+
+**Cause.** The artwork was on its own effect, keyed on the art URL and comparing
+against the last one seen — correct logic that never got to matter, because the
+effect body called only PLAIN PROCEDURES (`mpris-active-player`,
+`player-art-url`). `create-effect` re-runs when something the body read **as an
+accessor** changes; a plain procedure records no dependency, so the effect ran
+once at build time and then sat inert for the life of the tree.
+
+**Rule.** Every effect needs at least one accessor read, and the usual one is the
+service's watch: `(watch)` as the first form. This is also why the same file's
+readout effect was fine — it read the watch.
+
+**And the accessor has to be able to NOTICE.** The watch summary did not include
+`trackid` or `art-url`, and `create-connection` notifies only on an `equal?`
+change — so two videos sharing a title, artist, status and length publish an
+identical summary and notify NOTHING. The artwork is not a function of anything
+else in that list, so it has to be in the list. (Fixed in
+`(scheme-toolkit services mpris)`.)
+
+## `width-request` is a floor, not a cap — and `ellipsize` does not cap either
+
+**Symptom.** The audio panel changed width whenever a new video played.
+
+**Cause.** `max-width-chars` was set on some labels and not others. A
+`GtkLabel` with `ellipsize end` but NO `max-width-chars` still reports its **full
+natural width**, and the panel is fitted to its widest child — so a long video
+title sized the panel. *Measured:* title 385px inside a 380px request, panel box
+530px; after adding `max-width-chars 34` the same title measures 272px and the
+panel box 417px. Verified with a deliberately 92-character title: the panel did
+not move.
+
+**Rule, and `(scheme-desktop widgets bluetooth)` says the same thing at its
+`width` slot:** `width-request` does not cap anything, so EVERY label whose text
+comes from outside — device names, titles, artist strings, status lines — needs
+`max-width-chars` together with `ellipsize end`. A new label without the pair is
+a panel that starts moving again.

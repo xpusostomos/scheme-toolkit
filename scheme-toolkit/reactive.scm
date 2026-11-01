@@ -50,7 +50,7 @@
             create-effect create-connection
             create-root dispose-root
             on-cleanup on-mount
-            get-scope with-scope
+            get-scope with-scope current-scope
             st-create-context))
 
 ;;; ---------------------------------------------------------------------------
@@ -62,6 +62,28 @@
 
 ;; The scope that new effects, bindings and cleanups belong to.
 (define %scope (make-parameter #f))
+
+;; THE SAME PARAMETER, UNDER A NAME ANOTHER MODULE CAN HOLD.
+;;
+;; `with-scope' is the way to enter a scope and it is right for callers in the
+;; SAME module or in interpreted code.  A compiled module that calls it can get
+;; a WRONG ANSWER, and it cost an afternoon to find: Guile 3.0.11 inlines a
+;; one-line procedure like `with-scope' into its caller, and the inlined copy's
+;; reference to the module-private `%scope' resolved to the neighbouring
+;; procedure `get-scope' instead -- so `parameterize' was handed a procedure and
+;; died with
+;;
+;;   Not a parameter: #<procedure get-scope ()>
+;;
+;; from `(make <some-widget>)', which looks like a bug in the widget machinery
+;; and is not.  Making `with-scope' BIGGER made it stop, which is the giveaway:
+;; it is the inliner, not the code.
+;;
+;; So a module that has to enter a scope from compiled code parameterizes THIS
+;; binding -- an ordinary imported variable, with nothing to inline:
+;;
+;;   (parameterize ((current-scope scope)) (thunk))
+(define current-scope %scope)
 
 ;; Mount callbacks collected by the root currently being built.  Gnim bubbles
 ;; onMount to the nearest *unmounted* ancestor so that every mount runs once the

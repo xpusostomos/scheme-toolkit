@@ -18,7 +18,8 @@
 (use-modules (scheme-toolkit gi))
 (use-modules (scheme-toolkit tray))
 (use-modules (scheme-toolkit widget))
-(use-modules (scheme-toolkit astal))
+(use-modules (scheme-toolkit service-helpers))
+(use-modules (scheme-toolkit services tray))
 (use-modules (srfi srfi-1))
 (use-modules (srfi srfi-64))
 

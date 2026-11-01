@@ -17,7 +17,7 @@
   #:export (read-file read-file-lines
             write-file append-file
             mkdir-p expand-path
-            monitor-file
+            monitor-file monitor-directory
             xdg-config-home xdg-cache-home xdg-state-home))
 
 (eval-when (expand load eval)
@@ -42,12 +42,22 @@
 ;; hours.  The method takes (file, flags, cancellable) -- THREE arguments -- and
 ;; it was being called with two, which correctly answers "No applicable method".
 ;; Read the specializer COUNT, not just the classes.
-(define %g-file-monitor-file
+(define %gio-module
   (let ((m (resolve-module '(scheme-toolkit file gio) #:ensure #t)))
     (module-use! m (resolve-interface '(g-golf)))
     (eval '(g-irepository-require "Gio") m)
     (eval '(gi-import-by-name "Gio" "File") m)
-    (module-ref m 'monitor-file)))
+    m))
+
+(define %g-file-monitor-file (module-ref %gio-module 'monitor-file))
+
+;; AND GFile.monitor_directory, FETCHED THE SAME WAY FOR THE SAME REASON: this
+;; module exports a `monitor-directory' too.  A directory needs its own call --
+;; `monitor_file' on a directory reports changes to the DIRECTORY, not to what is
+;; in it.  Measured: a file created and removed inside a watched directory gave
+;; `monitor-file' zero events.  ags2-shell's trash watcher uses
+;; `monitor_directory', and so does `monitor-directory' below.
+(define %g-file-monitor-directory (module-ref %gio-module 'monitor-directory))
 
 (define (make-file-monitor path flags)
   "A GFileMonitor for PATH with FLAGS, or #f.
@@ -56,6 +66,10 @@ FLAGS is a list, not a symbol: G-Golf's bitfield conversion maps over the value,
 so a bare 'watch-moves fails with \"Wrong type argument: map\", naming neither
 the flag nor the call."
   (%g-file-monitor-file (g-file-new-for-path path) flags #f))
+
+(define (make-directory-monitor path flags)
+  "A GFileMonitor for the CONTENTS of directory PATH, with FLAGS."
+  (%g-file-monitor-directory (g-file-new-for-path path) flags #f))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reading and writing
@@ -149,28 +163,45 @@ Watching the same path twice adds a second callback to the SAME monitor rather
 than starting a second watch, so two widgets on one config file do not fight.
 The monitor stays referenced for as long as any callback is registered: an
 unreferenced GFileMonitor is collected and its watch then stops with no error."
-  (let* ((path (expand-path path))
-         (entry (hash-ref %monitors path)))
+  (%watch! (expand-path path) proc rate-limit make-file-monitor "file:"))
+
+(define* (monitor-directory path proc #:key (rate-limit 200))
+  "Call PROC with (kind path) whenever something IN directory PATH changes --
+an entry created, deleted, renamed or modified.  Returns a procedure that stops
+this callback.
+
+The directory counterpart of `monitor-file', with the same sharing and the same
+lifetime: see there.  It exists because `monitor-file' on a directory hears
+nothing about its contents (see `%g-file-monitor-directory')."
+  (%watch! (expand-path path) proc rate-limit make-directory-monitor "dir:"))
+
+(define (%watch! path proc rate-limit make-monitor prefix)
+  "The shared body of `monitor-file' and `monitor-directory'.
+
+KEYED BY PREFIX AND PATH, so a file watch and a directory watch on one path are
+two monitors and not one -- they hear different events."
+  (let* ((key (string-append prefix path))
+         (entry (hash-ref %monitors key)))
     (if entry
         (begin
           (set-cdr! entry (cons proc (cdr entry)))
-          (lambda () (%remove-watch! path proc)))
-        (let ((m (make-file-monitor path '(watch-moves))))
+          (lambda () (%remove-watch! key proc)))
+        (let ((m (make-monitor path '(watch-moves))))
           (when rate-limit (g-file-monitor-set-rate-limit m rate-limit))
-          (hash-set! %monitors path (cons m (list proc)))
+          (hash-set! %monitors key (cons m (list proc)))
           (connect m 'changed
                    (lambda (mon file other kind)
-                     (let ((e (hash-ref %monitors path)))
+                     (let ((e (hash-ref %monitors key)))
                        (when e
                          (for-each (lambda (cb) (cb kind path)) (cdr e))))))
-          (lambda () (%remove-watch! path proc))))))
+          (lambda () (%remove-watch! key proc))))))
 
-(define (%remove-watch! path proc)
-  (let ((entry (hash-ref %monitors path)))
+(define (%remove-watch! key proc)
+  (let ((entry (hash-ref %monitors key)))
     (when entry
       (set-cdr! entry (delq proc (cdr entry)))
       (when (null? (cdr entry))
-        (hash-remove! %monitors path)
+        (hash-remove! %monitors key)
         (catch #t (lambda () (g-file-monitor-cancel (car entry)))
                (lambda args #f))))))
 

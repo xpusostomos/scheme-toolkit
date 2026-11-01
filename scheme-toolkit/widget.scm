@@ -43,7 +43,7 @@
             this! fragment fragment? fragment-append! fragment-remove!
             on-fragment-change!
             text-node
-            apply-css! apply-class!
+            apply-css! apply-class! toggle-class! clear-box!
             child-type set-child-type!
             connect-signal!
             %element-setup
@@ -369,6 +369,37 @@ bytevector type error naming neither CSS nor priorities."
                    (if (string? class)
                        (string-split class #\space)
                        class)))
+
+(define (clear-box! box)
+  "Remove every child of BOX, walking GTK's own child list.
+
+Not `%element-children': a module that adds children with `add-child!' leaves
+that table empty, and clearing from it removes nothing -- which is how the tray
+came to grow a row every time an application started."
+  (let loop ((child (gtk-widget-get-first-child box)))
+    (when child
+      (let ((next (gtk-widget-get-next-sibling child)))
+        (catch #t (lambda () (remove-child! box child #f)) (lambda args #f))
+        (loop next))))
+  box)
+
+(define (toggle-class! widget name enable)
+  "Add or remove the CSS class NAME on WIDGET.
+
+This is ags2-shell's `toggle_class' from lib/ui.ts, and it is the way a panel
+button marks itself `active'.  It edits the class list in place rather than
+calling set-css-classes with a whole new list, so a binding that owns the
+`class' prop and a state marker like `active' do not overwrite each other --
+which is exactly what went wrong when the tray hand-edited `css-classes'."
+  (unless (is-a? widget <gtk-widget>)
+    (error "toggle-class!: not a widget" widget))
+  (catch #t
+    (lambda ()
+      (if enable
+          (gtk-widget-add-css-class widget name)
+          (gtk-widget-remove-css-class widget name))
+      #t)
+    (lambda args #f)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; element
