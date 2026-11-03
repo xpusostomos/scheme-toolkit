@@ -62,7 +62,7 @@
             widget-class-named widget-short-name
             widget-qualified-name widget-qualified-name-set!
             widget-name-from-class-name
-            monitors for-each-monitor monitor-name monitor-geometry
+            monitors for-each-monitor monitor-name monitor-geometry in-monitor-scope
             on-monitors-changed
             inspect
             unset-layer-shell-preload!))
@@ -90,6 +90,11 @@
 ;; which is exactly what per-monitor bars need.
 
 (define %monitor-roots (make-hash-table)) ; monitor name -> dispose
+;; AND ITS SCOPE, beside the dispose, so that work done LATER on a monitor's
+;; behalf -- a redraw from a config watcher, which runs on the main loop with no
+;; scope of its own -- can still belong to that monitor's root.  Without it,
+;; every `on-cleanup' in a re-render was registered nowhere and never ran.
+(define %monitor-scopes (make-hash-table))
 
 (define (app-instance) %app)
 
@@ -306,6 +311,33 @@ ones that arrived."
     (lambda ()
       (catch #t (lambda () (disconnect model id)) (lambda args #f)))))
 
+(define* (in-monitor-scope name thunk #:key (default #t))
+  "Run THUNK inside monitor NAME's root -- the one `for-each-monitor' made for
+it -- when there is one, and answer what it answered.
+
+FOR WORK DONE ON A MONITOR'S BEHALF BUT NOT WHILE BUILDING IT: a redraw after a
+config change, a rebuild after the widget list changed.  Both run from a watcher
+on the main loop, where no scope is current, so anything they create that
+registers a cleanup -- a timer, a signal handler, an effect -- was registered
+NOWHERE and never cleaned up.  That is the on-cleanup-outside-a-scope warning,
+one line per build.
+
+WITH NO ROOT FOR NAME, THUNK STILL RUNS, outside any scope: DEFAULT is what to
+do then -- #f to answer #f without running anything, which a caller inserting a
+widget nobody owns may prefer."
+  (let ((scope (hash-ref %monitor-scopes name)))
+    (cond
+     ;; `parameterize' ON THE IMPORTED PARAMETER, NOT `with-scope' -- the trap
+     ;; this module already documents in `widget-watch-own-options!'.  `with-scope'
+     ;; is one line, Guile 3.0.11 inlines it into this compiled module, and the
+     ;; inlined copy's reference to the module-private parameter resolves to the
+     ;; neighbouring `get-scope' procedure instead: "Not a parameter:
+     ;; #<procedure get-scope ()>", raised as soon as a layout change applied.
+     ;; MY OWN CODE HIT IT, having just fixed the same error elsewhere.
+     (scope (parameterize ((current-scope scope)) (thunk)))
+     (default (thunk))
+     (else #f))))
+
 (define* (for-each-monitor proc #:key (force? #f))
   "Call PROC with each connected monitor, keyed so that a monitor coming back
 keeps its identity.
@@ -339,6 +371,9 @@ monitors that have gone are disposed."
                     (let ((dispose
                            (create-root
                             (lambda (_dispose)
+                              ;; The scope `create-root' binds while PROC runs is
+                              ;; the one the root owns; keep it for `in-monitor-scope'.
+                              (hash-set! %monitor-scopes name (current-scope))
                               (proc mon name)))))
                       (hash-set! %monitor-roots name dispose)))))
               (display-monitors))
@@ -346,7 +381,8 @@ monitors that have gone are disposed."
     (for-each (lambda (pair)
                 (unless (hash-ref seen (car pair))
                   (catch #t (lambda () ((cdr pair))) (lambda args #f))
-                  (hash-remove! %monitor-roots (car pair))))
+                  (hash-remove! %monitor-roots (car pair))
+                  (hash-remove! %monitor-scopes (car pair))))
               (hash-map->list (lambda (k v) (cons k v)) %monitor-roots))
     (hash-count (const #t) %monitor-roots)))
 

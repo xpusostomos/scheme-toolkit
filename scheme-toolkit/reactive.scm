@@ -454,9 +454,23 @@ rather than an ambient one."
 a raw thunk."
   (dispose))
 
+(define (%enter-scope scope thunk)
+  ;; THE ACTUAL ENTRY, IN A PROCEDURE THE INLINER LEAVES ALONE.  Guile 3.0.11
+  ;; inlines a one-line procedure, and an inlined copy of this one, used from
+  ;; ANOTHER COMPILED MODULE, resolved its reference to the module-private
+  ;; `%scope' to the neighbouring `get-scope' procedure -- "Not a parameter:
+  ;; #<procedure get-scope ()>", raised from wherever the caller happened to be.
+  ;; Two statements is enough to stop the inliner: the comment above says that
+  ;; making `with-scope' bigger made it stop, and that is the giveaway that it is
+  ;; the inliner and not the code.
+  ;;
+  ;; Every caller used to have to know this.  None of them does now.
+  (parameterize ((%scope scope)) (thunk)))
+
 (define (with-scope scope thunk)
   "Run THUNK with SCOPE current, so anything it creates is owned by SCOPE."
-  (parameterize ((%scope scope)) (thunk)))
+  (let ((s scope) (t thunk))
+    (%enter-scope s t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Contexts
